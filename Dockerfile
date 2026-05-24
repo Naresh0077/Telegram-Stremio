@@ -21,4 +21,5 @@ COPY . .
 RUN uv lock
 RUN uv sync --locked
 RUN chmod +x start.sh
+EXPOSE 8000
 CMD ["bash", "start.sh"]
