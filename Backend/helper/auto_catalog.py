@@ -313,7 +313,7 @@ async def _fetch_tmdb_data(client: httpx.AsyncClient, doc: dict) -> tuple[dict, 
 
         async def _find():
             resp = await client.get(
-                f"https://api.themoviedb.org/3/find/{imdb_id}",
+                f"https://api.tmdb.org/3/find/{imdb_id}",
                 params={"api_key": api_key, "external_source": "imdb_id"},
             )
             if resp.status_code != 200:
@@ -330,14 +330,14 @@ async def _fetch_tmdb_data(client: httpx.AsyncClient, doc: dict) -> tuple[dict, 
     #----- Details (+keywords) and watch providers, each cached by media_type + tmdb_id
     async def _details():
         resp = await client.get(
-            f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}",
+            f"https://api.tmdb.org/3/{media_type}/{tmdb_id}",
             params={"api_key": api_key, "language": "en-US", "append_to_response": "keywords"},
         )
         return resp.json() if resp.status_code == 200 else {}
 
     async def _providers():
         resp = await client.get(
-            f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}/watch/providers",
+            f"https://api.tmdb.org/3/{media_type}/{tmdb_id}/watch/providers",
             params={"api_key": api_key},
         )
         return resp.json() if resp.status_code == 200 else {}

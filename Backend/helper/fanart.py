@@ -12,7 +12,7 @@ from Backend.logger import LOGGER
 
 _MOVIE_URL = "https://webservice.fanart.tv/v3/movies/{id}"
 _TV_URL = "https://webservice.fanart.tv/v3/tv/{id}"
-_EXTERNAL_IDS_URL = "https://api.themoviedb.org/3/tv/{id}/external_ids"
+_EXTERNAL_IDS_URL = "https://api.tmdb.org/3/tv/{id}/external_ids"
 
 _MOVIE_FIELDS = {
     "poster": ["movieposter"],
