@@ -1,4 +1,3 @@
-import asyncio
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -6,47 +5,26 @@ from typing import Optional
 from urllib.parse import quote, unquote
 
 import PTN
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.templating import Jinja2Templates
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import HTMLResponse
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.errors import UserNotParticipant
 
 from Backend import __version__, db
 from Backend.config import Telegram
-from Backend.helper.analytics import client_ip_from, record_client
 from Backend.fastapi.security.tokens import verify_token
-from Backend.fastapi.themes import DEFAULT_THEME, get_theme
-from Backend.helper.fanart import fanart_artwork
 from Backend.helper.global_search import global_search, is_global_search_enabled
 from Backend.helper.imdb import get_detail, get_season
-from Backend.helper.metadata import resolve_cover_url, COMBINED_SEASON, COMBINED_EPISODE_BASE
-from Backend.helper.split_files import parse_combined_episodes, combined_name_key
 from Backend.helper.settings_manager import SettingsManager
-from Backend.helper.subtitles import get_subtitles_for, stremio_subtitle_entries
 from Backend.logger import LOGGER
 from Backend.pyrofork.bot import StreamBot, get_streambot_url
 
 router = APIRouter(prefix="/stremio", tags=["Stremio Addon"])
-templates = Jinja2Templates(directory="Backend/fastapi/templates")
 
 #----- Addon configuration
 ADDON_NAME = "Telegram"
 ADDON_VERSION = __version__
 PAGE_SIZE = 15
-
-
-#----- Wrap a direct stream URL with the configured proxy (plain prepend or MediaFlow)
-def build_proxy_url(original_url: str) -> str | None:
-    settings = SettingsManager.current()
-    base = settings.http_proxy_url
-    if not base:
-        return None
-    if settings.mediaflow_proxy:
-        url = f"{base.rstrip('/')}/proxy/stream?d={quote(original_url, safe='')}"
-        if settings.mediaflow_password:
-            url += f"&api_password={quote(settings.mediaflow_password, safe='')}"
-        return url
-    return f"{base}{original_url}"
 
 _membership_cache: dict = {}
 _MEMBERSHIP_TTL = 60
@@ -101,22 +79,6 @@ def _visibility_query(token_data: dict) -> dict:
     ]}
 
 
-#----- Hide titles locked to a single catalog from default listings / search
-def _not_exclusive_clause(allow_searchable: bool = False) -> dict:
-    ors = [{"exclusive_catalog_id": {"$exists": False}}, {"exclusive_catalog_id": None}]
-    if allow_searchable:
-        ors.append({"exclusive_searchable": True})
-    return {"$or": ors}
-
-
-#----- Combine non-empty Mongo filters under a single $and
-def _merge_filters(*filters) -> dict:
-    parts = [f for f in filters if f]
-    if not parts:
-        return {}
-    return parts[0] if len(parts) == 1 else {"$and": parts}
-
-
 #----- Whether a title (by imdb id) may be seen by this token, honouring its own visibility
 async def _title_allowed(imdb_id: str, token_data: dict) -> bool:
     doc = await db.get_media_details(imdb_id=imdb_id)
@@ -134,50 +96,6 @@ GENRES = [
 ]
 
 
-#----- Turn a stored image reference into an absolute URL for Stremio clients.
-#----- Rebinds gradient covers and app-served /thumb paths to the current hosts.
-def _abs_media_url(value: str) -> str:
-    value = resolve_cover_url(value)
-    idx = value.find("/thumb/")
-    return f"{SettingsManager.current().base_url}{value[idx:]}" if idx != -1 else value
-
-
-BETTERPOSTER_DEFAULT = "https://btttr.cc/poster/imdb/poster-default/{imdb_id}.jpg"
-RPDB_FREE = "https://api.ratingposterdb.com/t0-free-rpdb/imdb/poster-default/{imdb_id}.jpg"
-
-
-def _poster_url(imdb_id: str, fallback: str) -> str:
-    settings = SettingsManager.current()
-    if imdb_id:
-        if settings.better_poster_enabled:
-            template = settings.better_poster or BETTERPOSTER_DEFAULT
-            return template.replace("{imdb_id}", str(imdb_id))
-        if settings.rpdb_enabled:
-            key = settings.rpdb_api_key
-            template = (
-                f"https://api.ratingposterdb.com/{key}/imdb/poster-default/{{imdb_id}}.jpg"
-                if key else RPDB_FREE
-            )
-            return template.replace("{imdb_id}", str(imdb_id))
-    return _abs_media_url(fallback)
-
-
-async def _apply_fanart(meta: dict, item: dict) -> None:
-    if not SettingsManager.current().fanart_enabled:
-        return
-    try:
-        art = await fanart_artwork(item.get("imdb_id"), item.get("tmdb_id"), item.get("media_type"))
-    except Exception as e:
-        LOGGER.warning(f"[FANART] artwork lookup failed for {item.get('imdb_id')}: {e}")
-        return
-    if art.get("poster"):
-        meta["poster"] = art["poster"]
-    if art.get("logo"):
-        meta["logo"] = art["logo"]
-    if art.get("background"):
-        meta["background"] = art["background"]
-
-
 #----- Map an internal media item into a Stremio meta object
 def convert_to_stremio_meta(item: dict) -> dict:
     media_type = "series" if item.get("media_type") == "tv" else "movie"
@@ -186,13 +104,13 @@ def convert_to_stremio_meta(item: dict) -> dict:
         "id": item.get('imdb_id'),
         "type": media_type,
         "name": item.get("title"),
-        "poster": _poster_url(item.get("imdb_id"), item.get("poster")),
+        "poster": item.get("poster") or "",
         "logo": item.get("logo") or "",
         "year": item.get("release_year"),
         "releaseInfo": str(item.get("release_year", "")),
         "imdb_id": item.get("imdb_id", ""),
         "moviedb_id": item.get("tmdb_id", ""),
-        "background": _abs_media_url(item.get("backdrop")),
+        "background": item.get("backdrop") or "",
         "genres": item.get("genres") or [],
         "imdbRating": str(item.get("rating") or ""),
         "description": item.get("description") or "",
@@ -273,21 +191,14 @@ def get_resolution_priority(stream_name: str) -> int:
     return 1
 
 
-#----- Canonical quality label used by per-token quality filtering
-def stream_res_label(stream_name: str) -> str:
-    return {2160: "4K", 1080: "1080p", 720: "720p", 480: "480p", 360: "360p"}.get(
-        get_resolution_priority(stream_name), "other"
-    )
-
-
 #----- Manifest describing the addon's catalogs/resources for this token
 @router.get("/{token}/manifest.json")
 async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
     if SettingsManager.current().hide_catalog:
-        resources = ["stream", "subtitles"]
+        resources = ["stream"]
         catalogs = []
     else:
-        resources = ["catalog", "meta", "stream", "subtitles"]
+        resources = ["catalog", "meta", "stream"]
         catalogs = [
             {
                 "type": "movie",
@@ -365,52 +276,33 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
         except Exception:
             pass
 
-        try:
-            order = await db.get_catalog_order()
-            token_order = (token_data.get("config") or {}).get("catalog_order") or []
-            effective = token_order or order
-            if effective:
-                rank = {k: i for i, k in enumerate(effective)}
-
-                def _crank(c):
-                    key = f"{c.get('id')}::{c.get('type')}"
-                    return rank.get(key, rank.get(c.get("id"), len(effective) + 1))
-
-                catalogs.sort(key=_crank)
-            hidden = set((token_data.get("config") or {}).get("hidden_catalogs") or [])
-            if hidden:
-                catalogs = [
-                    c for c in catalogs
-                    if c.get("id") not in hidden and f"{c.get('id')}::{c.get('type')}" not in hidden
-                ]
-        except Exception:
-            pass
-
 
     addon_name = ADDON_NAME
     addon_desc = "Streams movies and series from your Telegram."
     addon_version = ADDON_VERSION
+    expiry_obj = None
 
-    #----- Show expiry info in the addon: token's own expiry first, else the subscription
-    try:
-        expiry_obj = token_data.get("expires_at")
-        if expiry_obj is None and SettingsManager.current().subscription:
-            user_id = token_data.get("user_id")
-            if user_id:
+    if SettingsManager.current().subscription:
+        user_id = token_data.get("user_id")
+        if user_id:
+            try:
                 user = await db.get_user(int(user_id))
                 if user and user.get("subscription_status") == "active":
                     expiry_obj = user.get("subscription_expiry")
-
-        if expiry_obj:
-            expiry_str = expiry_obj.strftime("%d %b %Y").lstrip("0")
-            addon_desc = (
-                f"📅 Access active until {expiry_str}.\n"
-                f"Streams movies and series from your Telegram."
-            )
-            epoch_tag = format(int(expiry_obj.timestamp()) & 0xFFFF, "x")
-            addon_version = f"{ADDON_VERSION}-{epoch_tag}"
-    except Exception:
-        pass
+                    if expiry_obj:
+                        expiry_str = expiry_obj.strftime("%d %b %Y").lstrip("0")
+                        addon_name = f"{ADDON_NAME} — Expires {expiry_str}"
+                        addon_desc = (
+                            f"📅 Subscription active until {expiry_str}.\n"
+                            f"Streams movies and series from your Telegram."
+                        )
+                        epoch_tag = format(int(expiry_obj.timestamp()) & 0xFFFF, "x")
+                        addon_version = f"{ADDON_VERSION}-{epoch_tag}"
+                    else:
+                        addon_name = f"{ADDON_NAME} — Active"
+                        addon_desc = "✅ Subscription active.\nStreams movies and series from your Telegram."
+            except Exception:
+                pass
 
     return {
         "id": f"telegram.media.{token[:8]}",
@@ -479,14 +371,16 @@ async def get_catalog(token: str, media_type: str, id: str, extra: Optional[str]
                 if it.get("media_type") == db_media_type
                 and _token_can_view(*_effective_visibility(catalog, it), token_data)
             ]
-            visible_items.sort(key=lambda it: it.get("updated_on") or it.get("added_at") or datetime.min, reverse=True)
             start = (page - 1) * PAGE_SIZE
-            items = await db.get_documents(visible_items[start:start + PAGE_SIZE])
-            items = [it for it in items if _token_can_view(it.get("visibility") or "public", it.get("allowed_tokens") or [], token_data)]
+            items = []
+            for it in visible_items[start:start + PAGE_SIZE]:
+                doc = await db.get_document(it.get("media_type"), int(it.get("tmdb_id")), int(it.get("db_index", 1)))
+                if doc:
+                    items.append(doc)
         elif search_query:
             search_results = await db.search_documents(
                 query=search_query, page=page, page_size=PAGE_SIZE,
-                extra_filter=_merge_filters(_visibility_query(token_data), _not_exclusive_clause(allow_searchable=True)),
+                extra_filter=_visibility_query(token_data),
             )
             all_items = search_results.get("results", [])
             db_media_type = "tv" if media_type == "series" else "movie"
@@ -499,7 +393,7 @@ async def get_catalog(token: str, media_type: str, id: str, extra: Optional[str]
             else:
                 sort_params = [("updated_on", "desc")]
 
-            vis_filter = _merge_filters(_visibility_query(token_data), _not_exclusive_clause())
+            vis_filter = _visibility_query(token_data)
             if media_type == "movie":
                 data = await db.sort_movies(sort_params, page, PAGE_SIZE, genre_filter=genre_filter, extra_filter=vis_filter)
                 items = data.get("movies", [])
@@ -510,9 +404,19 @@ async def get_catalog(token: str, media_type: str, id: str, extra: Optional[str]
         return {"metas": []}
 
     metas = [convert_to_stremio_meta(item) for item in items]
-    if SettingsManager.current().fanart_enabled:
-        await asyncio.gather(*(_apply_fanart(m, it) for m, it in zip(metas, items)))
     return {"metas": metas}
+
+
+#----- Episode title: fall back to the file name when the title is just "S01E05"
+def _episode_display_title(episode: dict) -> str:
+    title = (episode.get("title") or "").strip()
+    if title and not re.fullmatch(r"(?i)s\d+e\d+", title):
+        return title
+    for f in episode.get("telegram") or []:
+        name = (f.get("name") or "").strip()
+        if name:
+            return re.sub(r"\.(mkv|mp4|avi|mov|webm|m4v|ts)$", "", name, flags=re.I)
+    return title or f"Episode {episode.get('episode_number')}"
 
 
 #----- Detailed metadata for a title, including series episode list
@@ -538,17 +442,15 @@ async def get_meta(token: str, media_type: str, id: str, token_data: dict = Depe
         "year": str(media.get("release_year", "")),
         "imdbRating": str(media.get("rating", "")),
         "genres": media.get("genres", []),
-        "poster": _poster_url(media.get("imdb_id") or imdb_id, media.get("poster")),
+        "poster": media.get("poster", ""),
         "logo": media.get("logo", ""),
-        "background": _abs_media_url(media.get("backdrop")),
+        "background": media.get("backdrop", ""),
         "imdb_id": media.get("imdb_id", ""),
         "releaseInfo": str(media.get("release_year", "")),
         "moviedb_id": media.get("tmdb_id", ""),
         "cast": media.get("cast") or [],
         "runtime": media.get("runtime") or "",
     }
-
-    await _apply_fanart(meta_obj, media)
 
     if media.get("media_type") == "movie":
         released_date = format_released_date(media)
@@ -564,36 +466,16 @@ async def get_meta(token: str, media_type: str, id: str, token_data: dict = Depe
                 episode_id = f"{id}:{season['season_number']}:{episode['episode_number']}"
                 videos.append({
                     "id": episode_id,
-                    "title": episode.get("title", f"Episode {episode['episode_number']}"),
+                    "title": _episode_display_title(episode),
                     "season": season.get("season_number"),
                     "episode": episode.get("episode_number"),
                     "overview": episode.get("overview") or "No description available for this episode yet.",
                     "released": episode.get("released") or yesterday,
-                    "thumbnail": _abs_media_url(episode.get("episode_backdrop")) or "https://raw.githubusercontent.com/weebzone/Colab-Tools/refs/heads/main/no_episode_backdrop.png",
+                    "thumbnail": episode.get("episode_backdrop") or "https://raw.githubusercontent.com/weebzone/Colab-Tools/refs/heads/main/no_episode_backdrop.png",
                     "imdb_id": episode.get("imdb_id") or media.get("imdb_id"),
                 })
         meta_obj["videos"] = videos
     return {"meta": meta_obj}
-
-
-#----- Subtitles for a title/episode, sourced from subtitle files in the channels
-@router.get("/{token}/subtitles/{media_type}/{id}/{extra:path}.json")
-@router.get("/{token}/subtitles/{media_type}/{id}.json")
-async def get_subtitles(token: str, media_type: str, id: str, extra: Optional[str] = None, token_data: dict = Depends(verify_token)):
-    try:
-        parts = id.split(":")
-        imdb_id = parts[0]
-        season = int(parts[1]) if len(parts) > 1 else None
-        episode = int(parts[2]) if len(parts) > 2 else None
-    except (ValueError, IndexError):
-        return {"subtitles": []}
-
-    db_media_type = "tv" if media_type == "series" else "movie"
-    subs = await get_subtitles_for(imdb_id, db_media_type, season, episode)
-    if not subs:
-        return {"subtitles": []}
-    return {"subtitles": stremio_subtitle_entries(subs, token, SettingsManager.current().base_url)}
-
 
 #----- Collect Global Search streams for a title/episode via IMDb lookup
 async def _global_streams_for(token: str, imdb_id: str, media_type: str, season_num: Optional[int], episode_num: Optional[int]) -> list:
@@ -626,13 +508,9 @@ async def _global_streams_for(token: str, imdb_id: str, media_type: str, season_
 
     streams = []
     for r in global_results:
-        is_split = bool(r.get("is_split"))
-        _, stream_title = format_stream_details(r["title"], r["quality"], r["size"], is_split=is_split)
+        _, stream_title = format_stream_details(r["title"], r["quality"], r["size"], is_split=False)
         stream_name = f"🌐 GLOBAL {r['quality']}"
         stream_title = f"{stream_title}\n📡 {r['source_chat']}"
-        if is_split:
-            kind = "zip parts" if r.get("is_zip") else "parts"
-            stream_title += f" · 📦 {r.get('part_count', 0)} {kind}"
         url = f"{SettingsManager.current().base_url}/dl/{token}/{r['token']}/{quote(r['title'])}"
         size_bytes = parse_size_to_bytes(r.get("size", ""))
         streams.append({"name": stream_name, "title": stream_title, "url": url, "size_bytes": size_bytes})
@@ -676,16 +554,8 @@ async def get_streams(
     token: str,
     media_type: str,
     id: str,
-    request: Request,
     token_data: dict = Depends(verify_token)
 ):
-    #----- Capture the real app/device from the addon-protocol UA (not the spoofed video UA)
-    asyncio.create_task(record_client(
-        token,
-        token_data.get("name") if token_data else None,
-        client_ip_from(request),
-        request.headers.get("user-agent", ""),
-    ))
 
     if token_data.get("subscription_expired"):
         return {
@@ -698,12 +568,8 @@ async def get_streams(
             ]
         }
 
-    #----- Subscription users must currently be members of the configured group.
-    #----- Admin, lifetime and admin-set token-expiry grants skip this check.
-    if (SettingsManager.current().subscription
-            and not token_data.get("is_admin")
-            and not token_data.get("subscription_exempt")
-            and not token_data.get("expires_at")):
+    #----- Subscription users must currently be members of the configured group
+    if SettingsManager.current().subscription:
         user_id = token_data.get("user_id")
         if user_id and not await _is_subscription_member(int(user_id)):
             return {
@@ -754,8 +620,6 @@ async def get_streams(
 
     streams = []
 
-    is_combined = season_num == COMBINED_SEASON and episode_num is not None and episode_num >= COMBINED_EPISODE_BASE
-
     if media_details and "telegram" in media_details:
         for quality in media_details.get("telegram", []):
             if quality.get("id"):
@@ -764,29 +628,40 @@ async def get_streams(
                 size = quality.get("size", "")
                 size_bytes = parse_size_to_bytes(size)
 
-                combined = parse_combined_episodes(filename) if is_combined else None
-                episode_start = combined.get("start") or 0 if combined else 0
-                name_key = combined_name_key(filename) if combined else ""
-
                 stream_name, stream_title = format_stream_details(
                     filename, quality_str, size, is_split=bool(quality.get("group_key"))
                 )
 
-                if combined:
-                    label = "Full" if combined.get("start") is None else f"E{combined['start']:02d}-E{combined['end']:02d}"
-                    if label.lower() not in stream_name.lower():
-                        stream_name = f"{stream_name} {label}"
-
                 original_url = f"{SettingsManager.current().base_url}/dl/{token}/{quality.get('id')}/video.mkv"
-                proxy_url = build_proxy_url(original_url)
+                proxy_url = f"{SettingsManager.current().http_proxy_url}{original_url}" if SettingsManager.current().http_proxy_url else None
 
                 if SettingsManager.current().show_proxy_and_non_proxy_both and proxy_url:
-                    streams.append({"name": f"{stream_name} (Proxy)", "title": stream_title, "url": proxy_url, "size_bytes": size_bytes, "episode_start": episode_start, "name_key": name_key})
-                    streams.append({"name": f"{stream_name} (Direct)", "title": stream_title, "url": original_url, "size_bytes": size_bytes, "episode_start": episode_start, "name_key": name_key})
+                    streams.append({
+                        "name": f"{stream_name} (Proxy)",
+                        "title": stream_title,
+                        "url": proxy_url,
+                        "size_bytes": size_bytes
+                    })
+                    streams.append({
+                        "name": f"{stream_name} (Direct)",
+                        "title": stream_title,
+                        "url": original_url,
+                        "size_bytes": size_bytes
+                    })
                 elif proxy_url:
-                    streams.append({"name": stream_name, "title": stream_title, "url": proxy_url, "size_bytes": size_bytes, "episode_start": episode_start, "name_key": name_key})
+                    streams.append({
+                        "name": stream_name,
+                        "title": stream_title,
+                        "url": proxy_url,
+                        "size_bytes": size_bytes
+                    })
                 else:
-                    streams.append({"name": stream_name, "title": stream_title, "url": original_url, "size_bytes": size_bytes, "episode_start": episode_start, "name_key": name_key})
+                    streams.append({
+                        "name": stream_name,
+                        "title": stream_title,
+                        "url": original_url,
+                        "size_bytes": size_bytes
+                    })
     elif is_global_search_enabled():
         try:
             streams.extend(
@@ -795,27 +670,13 @@ async def get_streams(
         except Exception as e:
             LOGGER.error(f"[GLOBAL SEARCH] stream search failed for {imdb_id}: {e}")
 
-    #----- Per-token quality filter (fall back to all if it would hide everything)
-    config = token_data.get("config") or {}
-    quality_filter = set(config.get("quality_filter") or [])
-    if quality_filter and streams:
-        filtered = [s for s in streams if stream_res_label(s.get("name", "")) in quality_filter]
-        if filtered:
-            streams = filtered
-
     if not streams:
         return {"streams": []}
 
-    ascending = config.get("quality_sort") == "asc"
-    if is_combined:
-        streams.sort(key=lambda s: s.get("episode_start", 0))
-        streams.sort(key=lambda s: s.get("name_key", ""))
-        streams.sort(key=lambda s: get_resolution_priority(s.get("name", "")), reverse=not ascending)
-    else:
-        streams.sort(
-            key=lambda s: (get_resolution_priority(s.get("name", "")), s.get("size_bytes", 0)),
-            reverse=not ascending
-        )
+    streams.sort(
+        key=lambda s: (get_resolution_priority(s.get("name", "")), s.get("size_bytes", 0)),
+        reverse=True
+    )
     name_count: dict = {}
     for s in streams:
         name_count[s["name"]] = name_count.get(s["name"], 0) + 1
@@ -829,135 +690,147 @@ async def get_streams(
 
 #----- Configure/install landing page rendered as HTML for a token
 @router.get("/{token}/configure")
-async def configure_addon(token: str, request: Request):
+async def configure_addon(token: str):
     manifest_url = f"{SettingsManager.current().base_url}/stremio/{token}/manifest.json"
     web_install_url = f"https://web.stremio.com/#/?addon_manifest={quote(manifest_url, safe='')}"
 
+    #----- Fetch user info for display
     token_doc = await db.get_api_token(token)
     user_name = "Unknown"
-    expiry_str = "Never"
+    expiry_str = "N/A"
     status_color = "#ef4444"
     status_text = "Unknown"
 
-    def _expired(when):
-        ref = datetime.utcnow()
-        try:
-            if when.tzinfo is not None:
-                ref = datetime.now(timezone.utc)
-        except AttributeError:
-            pass
-        return when < ref
-
-    def _fmt(when):
-        try:
-            return when.strftime("%d %b %Y").lstrip("0")
-        except Exception:
-            return "N/A"
-
     if token_doc:
         uid = token_doc.get("user_id")
-        is_admin = bool(token_doc.get("is_admin"))
-        try:
-            is_admin = is_admin or (uid is not None and int(uid) == int(Telegram.OWNER_ID))
-        except (TypeError, ValueError):
-            pass
-
-        user = None
         if uid:
             try:
                 user = await db.get_user(int(uid))
+                if user:
+                    user_name = user.get("first_name") or user.get("username") or f"User {uid}"
+                    sub_status = user.get("subscription_status", "")
+                    expiry = user.get("subscription_expiry")
+                    if expiry:
+                        expiry_str = expiry.strftime("%d %b %Y").lstrip("0")
+                    if sub_status == "active":
+                        status_color = "#22c55e"
+                        status_text = "✅ Active"
+                    else:
+                        status_color = "#ef4444"
+                        status_text = "🔴 Expired"
             except Exception:
-                user = None
-        if user:
-            user_name = user.get("first_name") or user.get("username") or f"User {uid}"
-        elif uid:
-            user_name = f"User {uid}"
+                pass
 
-        token_expiry = token_doc.get("expires_at")
-        if is_admin:
-            status_color, status_text, expiry_str = "#22c55e", "Admin", "Never"
-        elif token_doc.get("subscription_exempt"):
-            status_color, status_text, expiry_str = "#22c55e", "Active", "Never"
-        elif token_expiry is not None:
-            expiry_str = _fmt(token_expiry)
-            if _expired(token_expiry):
-                status_color, status_text = "#ef4444", "Expired"
-            else:
-                status_color, status_text = "#22c55e", "Active"
-        elif SettingsManager.current().subscription:
-            expiry = user.get("subscription_expiry") if user else None
-            if user and user.get("subscription_status") == "active" and expiry and not _expired(expiry):
-                status_color, status_text, expiry_str = "#22c55e", "Active", _fmt(expiry)
-            else:
-                status_color, status_text = "#ef4444", "Expired"
-                expiry_str = _fmt(expiry) if expiry else "N/A"
-        else:
-            status_color, status_text, expiry_str = "#22c55e", "Active", "Never"
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Update Telegram Stremio Addon</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f0f1a; color: #e2e8f0;
+      min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      padding: 24px;
+    }}
+    .card {{
+      background: #1e1e2e; border: 1px solid #2d2d44; border-radius: 16px;
+      padding: 40px 32px; max-width: 480px; width: 100%; text-align: center;
+    }}
+    .logo {{ font-size: 48px; margin-bottom: 12px; }}
+    h1 {{ font-size: 1.5rem; font-weight: 700; color: #f8fafc; margin-bottom: 6px; }}
+    .sub-title {{ color: #94a3b8; font-size: 0.9rem; margin-bottom: 28px; }}
+    .info-row {{
+      display: flex; justify-content: space-between; align-items: center;
+      background: #2a2a3e; border-radius: 10px; padding: 12px 16px;
+      margin-bottom: 12px; font-size: 0.9rem;
+    }}
+    .info-label {{ color: #94a3b8; }}
+    .info-val {{ font-weight: 600; color: #f1f5f9; }}
+    .status-badge {{
+      display: inline-block; padding: 2px 10px; border-radius: 999px;
+      font-size: 0.8rem; font-weight: 700;
+      background: {status_color}22; color: {status_color};
+    }}
+    .btn-update {{
+      display: block; width: 100%;
+      background: linear-gradient(135deg, #7c3aed, #4f46e5);
+      color: white; font-weight: 700; font-size: 1rem;
+      padding: 14px 24px; border-radius: 12px; border: none;
+      cursor: pointer; text-decoration: none; margin: 28px 0 12px;
+      transition: opacity 0.2s;
+    }}
+    .btn-update:hover {{ opacity: 0.85; }}
+    .btn-web {{
+      display: block; color: #6366f1; font-size: 0.85rem;
+      text-decoration: underline; margin-bottom: 20px;
+    }}
+    .steps {{
+      background: #2a2a3e; border-radius: 10px; padding: 14px 18px;
+      margin: 16px 0; text-align: left; font-size: 0.85rem; color: #cbd5e1;
+    }}
+    .steps b {{ color: #f1f5f9; }}
+    .steps ol {{ margin-top: 8px; margin-left: 18px; line-height: 1.8; }}
+    .url-box {{
+      background: #111827; border: 1px solid #374151; border-radius: 8px;
+      padding: 10px 14px; font-family: monospace; font-size: 0.75rem;
+      color: #94a3b8; word-break: break-all; text-align: left; margin-top: 16px;
+    }}
+    .btn-copy {{
+      margin-top: 10px; width: 100%; padding: 10px;
+      background: #1e293b; border: 1px solid #374151; color: #94a3b8;
+      border-radius: 8px; cursor: pointer; font-size: 0.85rem; transition: all 0.2s;
+    }}
+    .btn-copy:hover {{ background: #334155; color: #f1f5f9; }}
+    .hint {{ color: #64748b; font-size: 0.78rem; margin-top: 6px; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">🎬</div>
+    <h1>Telegram Stremio Addon</h1>
+    <p class="sub-title">Click the button below to install or update your addon in Stremio.</p>
 
-    return templates.TemplateResponse("stremio_configure.html", {
-        "request": request,
-        "theme": get_theme(request.session.get("theme", DEFAULT_THEME)),
-        "manifest_url": manifest_url,
-        "web_install_url": web_install_url,
-        "user_name": user_name,
-        "expiry_str": expiry_str,
-        "status_text": status_text,
-        "status_color": status_color,
-    })
+    <div class="info-row">
+      <span class="info-label">User</span>
+      <span class="info-val">{user_name}</span>
+    </div>
+    <div class="info-row">
+      <span class="info-label">Status</span>
+      <span class="status-badge">{status_text}</span>
+    </div>
+    <div class="info-row">
+      <span class="info-label">Expires</span>
+      <span class="info-val">{expiry_str}</span>
+    </div>
 
+    <a href="{web_install_url}" class="btn-update" target="_blank">
+      ⚡ Install / Update in Stremio
+    </a>
 
-#----- Catalogs this token can see, in effective (token or global) order
-async def _addon_catalogs_for_token(token_data: dict) -> list:
-    entries = [
-        {"id": "latest_movies", "name": "Latest Movies", "type": "movie"},
-        {"id": "top_movies", "name": "Popular Movies", "type": "movie"},
-        {"id": "latest_series", "name": "Latest Series", "type": "series"},
-        {"id": "top_series", "name": "Popular Series", "type": "series"},
-    ]
-    try:
-        for c in await db.get_custom_catalogs():
-            items = [i for i in (c.get("items") or []) if _token_can_view(*_effective_visibility(c, i), token_data)]
-            if not items:
-                continue
-            cid, name = f"custom_{c['_id']}", (c.get("name") or "Catalog")
-            if any(i.get("media_type") == "movie" for i in items):
-                entries.append({"id": cid, "name": name, "type": "movie"})
-            if any(i.get("media_type") == "tv" for i in items):
-                entries.append({"id": cid, "name": name, "type": "series"})
-    except Exception:
-        pass
-    for e in entries:
-        e["key"] = f"{e['id']}::{e['type']}"
-    order = await db.get_catalog_order()
-    tconf = token_data.get("config") or {}
-    effective = tconf.get("catalog_order") or order
-    if effective:
-        rank = {k: i for i, k in enumerate(effective)}
-        entries.sort(key=lambda e: rank.get(e["key"], rank.get(e["id"], len(effective) + 1)))
-    return entries
+    <div class="steps">
+      <b>Or install manually:</b>
+      <ol>
+        <li>Open Stremio → <b>Add-ons</b> tab</li>
+        <li>Click the <b>🔍 Search / URL</b> icon</li>
+        <li>Paste the URL below and press Enter</li>
+      </ol>
+    </div>
 
-
-#----- Read this token's addon config + catalog list (public, used by configure page)
-@router.get("/{token}/addon-config")
-async def get_addon_config(token: str):
-    doc = await db.get_api_token(token)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Invalid token")
-    return {"config": doc.get("config") or {}, "catalogs": await _addon_catalogs_for_token(doc)}
-
-
-#----- Persist this token's addon config (public, used by configure page)
-@router.post("/{token}/addon-config")
-async def save_addon_config(token: str, payload: dict):
-    doc = await db.get_api_token(token)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Invalid token")
-    valid_q = {"480p", "720p", "1080p", "4K"}
-    config = {
-        "quality_sort": "asc" if payload.get("quality_sort") == "asc" else "desc",
-        "quality_filter": [q for q in (payload.get("quality_filter") or []) if q in valid_q],
-        "hidden_catalogs": [str(x) for x in (payload.get("hidden_catalogs") or [])],
-        "catalog_order": [str(x) for x in (payload.get("catalog_order") or [])],
-    }
-    await db.set_token_config(token, config)
-    return {"ok": True, "config": config}
+    <div class="url-box" id="murl">{manifest_url}</div>
+    <button onclick="copyUrl()" class="btn-copy">📋 Copy URL</button>
+    <script>
+      function copyUrl() {{
+        navigator.clipboard.writeText('{manifest_url}').then(() => {{
+          const b = document.querySelector('.btn-copy');
+          b.textContent = '✅ Copied!';
+          setTimeout(() => b.textContent = '📋 Copy URL', 2000);
+        }});
+      }}
+    </script>
+  </div>
+</body>
+</html>"""
+    return HTMLResponse(html)
