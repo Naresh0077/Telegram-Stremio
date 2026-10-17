@@ -15,6 +15,7 @@ from Backend.config import Telegram
 from Backend.fastapi.security.tokens import verify_token
 from Backend.helper.global_search import global_search, is_global_search_enabled
 from Backend.helper.imdb import get_detail, get_season
+from Backend.helper.metadata import resolve_cover_url
 from Backend.helper.settings_manager import SettingsManager
 from Backend.logger import LOGGER
 from Backend.pyrofork.bot import StreamBot, get_streambot_url
@@ -104,13 +105,13 @@ def convert_to_stremio_meta(item: dict) -> dict:
         "id": item.get('imdb_id'),
         "type": media_type,
         "name": item.get("title"),
-        "poster": item.get("poster") or "",
+        "poster": resolve_cover_url(item.get("poster") or ""),
         "logo": item.get("logo") or "",
         "year": item.get("release_year"),
         "releaseInfo": str(item.get("release_year", "")),
         "imdb_id": item.get("imdb_id", ""),
         "moviedb_id": item.get("tmdb_id", ""),
-        "background": item.get("backdrop") or "",
+        "background": resolve_cover_url(item.get("backdrop") or ""),
         "genres": item.get("genres") or [],
         "imdbRating": str(item.get("rating") or ""),
         "description": item.get("description") or "",
@@ -442,9 +443,9 @@ async def get_meta(token: str, media_type: str, id: str, token_data: dict = Depe
         "year": str(media.get("release_year", "")),
         "imdbRating": str(media.get("rating", "")),
         "genres": media.get("genres", []),
-        "poster": media.get("poster", ""),
+        "poster": resolve_cover_url(media.get("poster", "")),
         "logo": media.get("logo", ""),
-        "background": media.get("backdrop", ""),
+        "background": resolve_cover_url(media.get("backdrop", "")),
         "imdb_id": media.get("imdb_id", ""),
         "releaseInfo": str(media.get("release_year", "")),
         "moviedb_id": media.get("tmdb_id", ""),
@@ -471,7 +472,7 @@ async def get_meta(token: str, media_type: str, id: str, token_data: dict = Depe
                     "episode": episode.get("episode_number"),
                     "overview": episode.get("overview") or "No description available for this episode yet.",
                     "released": episode.get("released") or yesterday,
-                    "thumbnail": episode.get("episode_backdrop") or "https://raw.githubusercontent.com/weebzone/Colab-Tools/refs/heads/main/no_episode_backdrop.png",
+                    "thumbnail": resolve_cover_url(episode.get("episode_backdrop") or "") or "https://raw.githubusercontent.com/weebzone/Colab-Tools/refs/heads/main/no_episode_backdrop.png",
                     "imdb_id": episode.get("imdb_id") or media.get("imdb_id"),
                 })
         meta_obj["videos"] = videos
