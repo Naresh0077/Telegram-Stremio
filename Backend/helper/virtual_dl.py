@@ -67,7 +67,7 @@ async def virtual_stream_generator(
         offset = local_start - (local_start % chunk_size)
         first_part_cut = local_start - offset
         last_part_cut = (local_end % chunk_size) + 1
-        part_count = math.ceil(local_end / chunk_size) - math.floor(offset / chunk_size)
+        part_count = math.ceil((local_end + 1) / chunk_size) - math.floor(offset / chunk_size)
 
         body_gen = await streamer.prefetch_stream(
             file_id=part["file_id"],

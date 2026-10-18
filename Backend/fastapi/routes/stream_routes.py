@@ -317,7 +317,7 @@ async def media_streamer(request: Request, chat_id: int, msg_id: int, token: str
     offset = start - (start % chunk_size)
     first_part_cut = start - offset
     last_part_cut = (end % chunk_size) + 1
-    part_count = math.ceil(end / chunk_size) - math.floor(offset / chunk_size)
+    part_count = math.ceil((end + 1) / chunk_size) - math.floor(offset / chunk_size)
     stream_id = secrets.token_hex(8)
     decoded_name = unquote(request.path_params.get("name", ""))
     final_title = await _lookup_title(stream_id_hash, decoded_name)
@@ -456,7 +456,7 @@ async def global_media_streamer(request: Request, chat_id: int, msg_id: int, tok
     offset = start - (start % chunk_size)
     first_part_cut = start - offset
     last_part_cut = (end % chunk_size) + 1
-    part_count = math.ceil(end / chunk_size) - math.floor(offset / chunk_size)
+    part_count = math.ceil((end + 1) / chunk_size) - math.floor(offset / chunk_size)
     stream_id = secrets.token_hex(8)
 
     meta = {

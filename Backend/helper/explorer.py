@@ -47,6 +47,20 @@ FID_RE = re.compile(r"^-?\d+_\d+$")
 MEDIA_ATTRS = ("video", "audio", "voice", "video_note", "animation", "document", "photo")
 
 
+#----- Root-level folder names that would clash with built-in /explorer/<view> URLs
+RESERVED_ROOT_NAMES = {"home", "all files", "videos", "audio", "images", "documents", "archives", "subtitles",
+                       "other", "favorites", "folders", "channels"}
+
+
+def check_folder_name(name: str, parent_id: Optional[str]) -> str:
+    name = (name or "").strip()
+    if not name or len(name) > 120 or any(c in name for c in '/\\?#%') or name in (".", ".."):
+        raise ValueError("Invalid folder name (no / \\ ? # % characters)")
+    if not parent_id and name.lower() in RESERVED_ROOT_NAMES:
+        raise ValueError(f"'{name}' is a built-in view name - choose another name")
+    return name
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -330,9 +344,7 @@ class ExplorerStore:
         return out
 
     async def create_folder(self, name: str, parent_id: Optional[str] = None) -> dict:
-        name = (name or "").strip()
-        if not name or len(name) > 120 or "/" in name:
-            raise ValueError("Invalid folder name")
+        name = check_folder_name(name, parent_id)
         if parent_id and not await self.folders.find_one({"_id": parent_id}):
             raise ValueError("Parent folder not found")
         if await self.folders.find_one({"parent_id": parent_id or None, "name_lc": name.lower()}):
@@ -364,12 +376,11 @@ class ExplorerStore:
             if parent_id and not await self.folders.find_one({"_id": parent_id}):
                 raise ValueError("Target folder not found")
             new_parent = parent_id or None
+            check_folder_name(folder["name"], new_parent)
             upd["parent_id"] = new_parent
         new_name = folder["name"]
         if name is not None:
-            new_name = name.strip()
-            if not new_name or len(new_name) > 120 or "/" in new_name:
-                raise ValueError("Invalid folder name")
+            new_name = check_folder_name(name, new_parent)
             upd.update({"name": new_name, "name_lc": new_name.lower()})
         clash = await self.folders.find_one({"parent_id": new_parent, "name_lc": new_name.lower(), "_id": {"$ne": folder_id}})
         if clash:

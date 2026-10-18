@@ -315,6 +315,9 @@ async def test_page_renders(server):
     async with httpx.AsyncClient() as c:
         r = await c.get(server.base + "/explorer")
         assert r.status_code == 200 and "File Explorer" in r.text and "Telegram channels" in r.text
+        for deep in ("/explorer/Movies", "/explorer/Movies/2024", "/explorer/Channels/My%20Channel", "/explorer/All%20Files"):
+            d = await c.get(server.base + deep)
+            assert d.status_code == 200 and "File Explorer" in d.text, deep      # every folder URL serves the app
         assert "{%" not in r.text and "{{" not in r.text.replace("${", "")  # jinja fully rendered
 
 
@@ -352,14 +355,14 @@ async def test_json_named_file_streams(server, indexed, store, media):
     server.files[(CHAT2, 7777)] = j
     await store.upsert_doc(ex.message_to_doc(fake_msg(CHAT2, 7777, "document", name="data.json", size=j.stat().st_size, mime="application/json"), "T"))
     async with httpx.AsyncClient() as c:
-        r = await c.get(f"{server.base}/explorer/stream/{CHAT2}_7777/data.json")
+        r = await c.get(f"{server.base}/_ex/stream/{CHAT2}_7777/data.json")
         assert r.status_code == 200 and r.json() == {"a": 1}
 
 
 async def test_byte_range_streaming_matches_file(server, indexed, media):
     fid = indexed["mp4"]; data = media["mp4"].read_bytes(); n = len(data)
     async with httpx.AsyncClient() as c:
-        u = f"{server.base}/explorer/stream/{fid}/ok.mp4"
+        u = f"{server.base}/_ex/stream/{fid}/ok.mp4"
         r = await c.get(u)
         assert r.status_code == 200 and r.content == data and r.headers["accept-ranges"] == "bytes"
         for rng, (s, e) in {"bytes=100-5000": (100, 5000), f"bytes={n // 2}-": (n // 2, n - 1), "bytes=-777": (n - 777, n - 1)}.items():
@@ -377,28 +380,30 @@ async def test_signed_links_and_access_control(server, indexed, media):
     fid = indexed["mp4"]; data = media["mp4"].read_bytes()
     async with httpx.AsyncClient() as c:
         L = (await c.get(f"{server.base}/api/explorer/links/{fid}")).json()
-        assert L["stream"].startswith("http") and "/explorer/s/" in L["stream"]
+        assert L["stream"].startswith("http") and "/_ex/s/" in L["stream"]
         assert "token" not in L["stream"].lower() and "bot" not in L["stream"].lower()  # no Telegram credentials
         r = await c.get(L["stream"].replace("http://127.0.0.1:" + server.base.rsplit(":", 1)[1], server.base))
         assert r.status_code == 200 and r.content == data
-        r = await c.get(L["download"]); assert "attachment" in r.headers["content-disposition"]
+        assert L["download"] is None                                   # no download link for video/audio
+        r = await c.get(L["stream"] + "?dl=1")
+        assert r.status_code == 200 and "attachment" not in r.headers["content-disposition"] and r.content == data   # ?dl=1 ignored for media
         bad = L["stream"].replace("/s/", "/s/").rsplit("/", 3)
         tampered = L["stream"][:-len("ok.mp4") - 1] + "/ok.mp4"
-        parts = L["stream"].split("/explorer/s/")[1].split("/")
-        forged = f"{server.base}/explorer/s/{parts[0]}/{'0' * 32}/{parts[2]}/{parts[3]}"
+        parts = L["stream"].split("/_ex/s/")[1].split("/")
+        forged = f"{server.base}/_ex/s/{parts[0]}/{'0' * 32}/{parts[2]}/{parts[3]}"
         assert (await c.get(forged)).status_code == 403
-        expired = f"{server.base}/explorer/s/1/{'0' * 32}/{parts[2]}/{parts[3]}"
+        expired = f"{server.base}/_ex/s/1/{'0' * 32}/{parts[2]}/{parts[3]}"
         assert (await c.get(expired)).status_code == 403
-        assert (await c.get(f"{server.base}/explorer/stream/not-an-id/x")).status_code == 400
-        assert (await c.get(f"{server.base}/explorer/stream/{CHAT2}_99999/x")).status_code == 404   # not in index
+        assert (await c.get(f"{server.base}/_ex/stream/not-an-id/x")).status_code == 400
+        assert (await c.get(f"{server.base}/_ex/stream/{CHAT2}_99999/x")).status_code == 404   # not in index
 
 
 async def test_vlc_playlist_and_reg(server, indexed):
     async with httpx.AsyncClient() as c:
-        r = await c.get(f"{server.base}/explorer/vlc/{indexed['mp4']}.m3u")
-        assert r.status_code == 200 and r.text.startswith("#EXTM3U") and "/explorer/s/" in r.text
+        r = await c.get(f"{server.base}/_ex/vlc/{indexed['mp4']}.m3u")
+        assert r.status_code == 200 and r.text.startswith("#EXTM3U") and "/_ex/s/" in r.text
         assert "attachment" in r.headers["content-disposition"]
-        reg = await c.get(f"{server.base}/explorer/vlc-setup.reg")
+        reg = await c.get(f"{server.base}/_ex/vlc-setup.reg")
         assert reg.text.startswith("Windows Registry Editor Version 5.00") and "URL Protocol" in reg.text and "vlc.exe" in reg.text
 
 
@@ -436,15 +441,47 @@ async def test_every_media_type_streams_untouched_for_vlc(server, indexed, media
             r = await c.get(url, headers={"Range": "bytes=1000-9999"})
             assert r.status_code == 206 and r.content == data[1000:10000], k
             m3u = (await c.get(L["vlc_playlist"])).text
-            assert url.split("/explorer/s/")[1].split("/")[2] in m3u and m3u.startswith("#EXTM3U"), k
-            assert L["vlc_uri"] == "vlc://" + url
+            assert url.split("/_ex/s/")[1].split("/")[2] in m3u and m3u.startswith("#EXTM3U"), k
+            from urllib.parse import quote
+            assert L["vlc_uri"] == "vlc://play/" + quote(url, safe="") and L["download"] is None
     # missing Telegram message -> clean error instead of a crash
     await store.upsert_doc(ex.message_to_doc(fake_msg(CHAT2, 6666, "document", name="gone.mp4", size=10, mime="video/mp4"), "T"))
     async with httpx.AsyncClient() as c:
-        assert (await c.get(f"{server.base}/explorer/stream/{CHAT2}_6666/gone.mp4")).status_code in (404, 502)
+        assert (await c.get(f"{server.base}/_ex/stream/{CHAT2}_6666/gone.mp4")).status_code in (404, 502)
 
 
 async def test_no_server_side_conversion_endpoints(server, indexed):
     async with httpx.AsyncClient() as c:
-        assert (await c.get(f"{server.base}/explorer/play/{indexed['mp4']}/ok.mp4")).status_code == 404
         assert (await c.get(f"{server.base}/api/explorer/probe/{indexed['mp4']}")).status_code == 404
+
+
+async def test_non_media_download_still_offered(server, indexed, store, media):
+    j = media["mp4"].parent / "notes.txt"; j.write_text("hello")
+    server.files[(CHAT2, 8888)] = j
+    await store.upsert_doc(ex.message_to_doc(fake_msg(CHAT2, 8888, "document", name="notes.txt", size=5, mime="text/plain"), "T"))
+    async with httpx.AsyncClient() as c:
+        L = (await c.get(f"{server.base}/api/explorer/links/{CHAT2}_8888")).json()
+        assert L["download"] and (await c.get(L["download"])).headers["content-disposition"].startswith("attachment")
+
+
+async def test_folder_names_are_url_safe_and_reserved(store):
+    for bad in ("Videos", "all files", "Favorites", "CHANNELS", "a/b", "q?x", "a#b", "100%", "..", ""):
+        with pytest.raises(ValueError):
+            await store.create_folder(bad)
+    parent = await store.create_folder("Series")
+    ok = await store.create_folder("Videos", parent["id"])          # reserved names only matter at the root
+    assert ok["name"] == "Videos"
+    with pytest.raises(ValueError):
+        await store.update_folder(ok["id"], parent_id=None, move=True)   # moving it to root would clash
+
+
+async def test_vlc_registry_file_is_well_formed_and_injection_safe():
+    from Backend.fastapi.routes.explorer_routes import build_vlc_reg
+    reg = build_vlc_reg()
+    assert "[HKEY_CURRENT_USER\\Software\\Classes\\vlc\\shell\\open\\command]" in reg and "vlc://play/" in reg
+    val = [l for l in reg.splitlines() if l.startswith('@="powershell')][0]
+    raw = val[3:-1].replace('\\"', '"').replace("\\\\", "\\")          # undo .reg escaping
+    assert raw.count('"') == 2 and raw.startswith("powershell.exe") and "VideoLAN\\VLC\\vlc.exe" in raw and "%1" in raw
+    evil = build_vlc_reg('C:\\x" ; calc.exe ; "\\vlc.exe')
+    assert "calc.exe" not in evil                                   # invalid path falls back to the default
+    assert "D:\\\\Apps\\\\VLC\\\\vlc.exe" in build_vlc_reg("D:\\Apps\\VLC\\vlc.exe")

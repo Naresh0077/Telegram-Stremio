@@ -1,40 +1,47 @@
-"""File Explorer routes: /explorer page, /api/explorer/* JSON API and streaming endpoints.
+"""File Explorer routes.
 
-Video/audio playback is done in VLC (signed link / playlist); no server-side conversion.
-Streaming deliberately reuses stream_routes.media_streamer (the exact Telegram/MTProto path Stremio
-uses: range requests, multi-client pool, prefetch, file-reference refresh) instead of re-implementing it.
+* Pages:      /explorer and /explorer/<anything>   (same single-page app; every folder has its own URL)
+* JSON API:   /api/explorer/*
+* Raw bytes:  /_ex/*   (kept off /explorer/ so folder names can never collide with technical endpoints)
+
+Video/audio playback happens in VLC (signed link / vlc:// protocol); the server never converts or offers a
+download for media. Streaming reuses stream_routes.media_streamer - the exact Telegram/MTProto path Stremio uses.
 """
 from __future__ import annotations
 
 import asyncio
-import time
+import os
+import re
 from collections import OrderedDict
 from typing import List, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, Response
 
+from Backend.config import Telegram
 from Backend.fastapi.routes.stream_routes import _content_disposition, media_streamer, select_best_client
 from Backend.fastapi.routes.template_routes import _base_context, templates
 from Backend.fastapi.security.credentials import get_current_user, require_auth
 from Backend.helper.exceptions import FileNotFound
 from Backend.helper.explorer import (
     KINDS, LINK_TTL, configured_channels, extract_media, get_indexer, get_store, parse_fid,
-    public_doc, sign_link, verify_link,
+    sign_link, verify_link,
 )
 from Backend.helper.settings_manager import SettingsManager
 from Backend.logger import LOGGER
-from Backend.config import Telegram
 from Backend.pyrofork.bot import StreamBot, multi_clients
 
 router = APIRouter(tags=["Explorer"])
 
+MEDIA_KINDS = ("video", "audio")
 _thumb_cache: "OrderedDict[str, bytes]" = OrderedDict()
 _img_cache: "OrderedDict[str, tuple]" = OrderedDict()
 _THUMB_MAX, _IMG_MAX = 600, 12
 _MAX_IMAGE_BYTES = 40 * 1024 * 1024
 _TEXT_PREVIEW_BYTES = 256 * 1024
+_VLC_PATH_RE = re.compile(r"^[A-Za-z]:\\[A-Za-z0-9 _.()\-\\]{1,200}\.exe$")
+DEFAULT_VLC_PATH = r"C:\Program Files\VideoLAN\VLC\vlc.exe"
 
 
 #----- helpers -------------------------------------------------------------------------------------
@@ -66,7 +73,7 @@ def _public_base(request: Request) -> str:
 
 def _signed_path(fid: str, name: str, ttl: int = LINK_TTL) -> tuple:
     exp, sig = sign_link(fid, ttl)
-    return f"/explorer/s/{exp}/{sig}/{fid}/{quote(name, safe='')}", exp
+    return f"/_ex/s/{exp}/{sig}/{fid}/{quote(name, safe='')}", exp
 
 
 def _lru_put(cache: OrderedDict, key, value, limit: int) -> None:
@@ -77,8 +84,10 @@ def _lru_put(cache: OrderedDict, key, value, limit: int) -> None:
 
 
 #----- Core Telegram byte-range streaming (shared by session + signed endpoints) ---------------------
-async def _serve_file(request: Request, fid: str, disposition: str = "inline"):
+async def _serve_file(request: Request, fid: str, want_download: bool = False):
     doc = await _doc_or_404(fid)
+    #----- video/audio are play-only: never served as an attachment
+    disposition = "attachment" if (want_download and doc.get("kind") not in MEDIA_KINDS) else "inline"
     if not multi_clients:
         raise HTTPException(status_code=503, detail="No Telegram client available")
     if doc.get("attr") == "photo":
@@ -110,7 +119,7 @@ async def _serve_image(fid: str, doc: dict, disposition: str = "inline"):
             if getattr(msg, "empty", False):
                 raise FileNotFound()
             if doc.get("size", 0) > _MAX_IMAGE_BYTES:
-                raise HTTPException(status_code=413, detail="Image too large to preview; use Download")
+                raise HTTPException(status_code=413, detail="Image too large to preview")
             buf = await client.download_media(msg, in_memory=True)
             data, mime = buf.getvalue(), doc.get("mime") or "image/jpeg"
         except HTTPException:
@@ -121,21 +130,13 @@ async def _serve_image(fid: str, doc: dict, disposition: str = "inline"):
             LOGGER.warning(f"[Explorer] image fetch failed for {fid}: {e}")
             raise HTTPException(status_code=502, detail="Telegram could not provide this image right now")
         _lru_put(_img_cache, fid, (data, mime), _IMG_MAX)
-    return Response(content=data, media_type=mime, headers={
+    from fastapi.responses import Response as _R
+    return _R(content=data, media_type=mime, headers={
         "Content-Disposition": _content_disposition(doc["name"], disposition),
         "Cache-Control": "private, max-age=300",
         "Content-Security-Policy": "sandbox",
         "X-Content-Type-Options": "nosniff",
     })
-
-
-#----- Page ------------------------------------------------------------------------------------------
-@router.get("/explorer", response_class=HTMLResponse)
-async def explorer_page(request: Request, _: bool = Depends(require_auth)):
-    ctx = _base_context(request)
-    ctx["current_user"] = get_current_user(request)
-    ctx["kinds"] = list(KINDS)
-    return templates.TemplateResponse("explorer.html", ctx)
 
 
 #----- Index / listing -------------------------------------------------------------------------------
@@ -146,6 +147,7 @@ async def api_summary(_: bool = Depends(require_auth)):
     data = await store.summary()
     data["status"] = get_indexer().get_status()
     data["configured_channels"] = configured_channels()
+    data["default_vlc_path"] = DEFAULT_VLC_PATH
     return data
 
 
@@ -232,19 +234,21 @@ async def api_favorite(payload: dict, _: bool = Depends(require_auth)):
     return {"updated": await get_store().set_favorite(fids, bool(payload.get("value", True)))}
 
 
-#----- Links: stream / download / VLC / Stremio -------------------------------------------------------------
+#----- Links: stream / VLC / Stremio -------------------------------------------------------------------------
 @router.get("/api/explorer/links/{fid}")
 async def api_links(fid: str, request: Request, _: bool = Depends(require_auth)):
     doc = await _doc_or_404(fid)
     base = _public_base(request)
     path, exp = _signed_path(fid, doc["name"])
     stream = f"{base}{path}"
+    is_media = doc.get("kind") in MEDIA_KINDS
     out = {
         "stream": stream,
-        "download": f"{stream}?dl=1",
-        "vlc_playlist": f"{base}/explorer/vlc/{fid}.m3u",
-        "vlc_uri": f"vlc://{stream}",
-        "vlc_setup": f"{base}/explorer/vlc-setup.reg",
+        #----- no download link for video/audio
+        "download": None if is_media else f"{stream}?dl=1",
+        "vlc_uri": "vlc://play/" + quote(stream, safe=""),      # percent-encoded so browsers/Windows can't mangle it
+        "vlc_playlist": f"{base}/_ex/vlc/{fid}.m3u",
+        "vlc_setup": f"{base}/_ex/vlc-setup.reg",
         "expires_at": exp,
         "stremio": None,
     }
@@ -259,51 +263,57 @@ async def api_links(fid: str, request: Request, _: bool = Depends(require_auth))
     return out
 
 
-@router.get("/explorer/vlc/{fid}.m3u")
+@router.get("/_ex/vlc/{fid}.m3u")
 async def vlc_playlist(fid: str, request: Request, _: bool = Depends(require_auth)):
     doc = await _doc_or_404(fid)
     path, _exp = _signed_path(fid, doc["name"])
     title = doc["name"].replace("\n", " ").replace("\r", " ")
     body = f"#EXTM3U\r\n#EXTINF:{doc.get('duration') or -1},{title}\r\n{_public_base(request)}{path}\r\n"
     return Response(content=body, media_type="audio/x-mpegurl", headers={
-        "Content-Disposition": _content_disposition("stream.m3u", "attachment"),
+        "Content-Disposition": _content_disposition("play.m3u", "attachment"),
         "Cache-Control": "no-store",
     })
 
 
-@router.get("/explorer/vlc-setup.reg")
-async def vlc_protocol_reg(_: bool = Depends(require_auth)):
-    ps = ("$u='%1' -replace '^vlc://',''; "
-          "$p='C:\\Program Files\\VideoLAN\\VLC\\vlc.exe'; "
-          "if(!(Test-Path $p)){$p='C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe'}; "
-          "& $p $u")
-    cmd = 'powershell.exe -NoProfile -WindowStyle Hidden -Command "' + ps + '"'
+def build_vlc_reg(vlc_path: str = DEFAULT_VLC_PATH) -> str:
+    """Registry file that makes Windows (and thus the browser) launch VLC for vlc://play/<encoded-url> links."""
+    if not _VLC_PATH_RE.match(vlc_path or ""):
+        vlc_path = DEFAULT_VLC_PATH
+    x86 = vlc_path.replace("Program Files\\", "Program Files (x86)\\", 1) if "(x86)" not in vlc_path else vlc_path
+    ps = ("$u=[uri]::UnescapeDataString(('%1' -replace '^vlc://play/','').TrimEnd('/')); "
+          f"$p='{vlc_path}'; if(!(Test-Path $p)){{$p='{x86}'}}; "
+          "Start-Process -FilePath $p -ArgumentList $u")
+    cmd = 'powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command "' + ps + '"'
     reg_cmd = cmd.replace("\\", "\\\\").replace('"', '\\"')
-    reg = ("Windows Registry Editor Version 5.00\r\n\r\n"
-           "[HKEY_CURRENT_USER\\Software\\Classes\\vlc]\r\n@=\"URL:VLC Protocol\"\r\n\"URL Protocol\"=\"\"\r\n\r\n"
-           "[HKEY_CURRENT_USER\\Software\\Classes\\vlc\\shell\\open\\command]\r\n"
-           f"@=\"{reg_cmd}\"\r\n")
-    return Response(content=reg, media_type="application/octet-stream", headers={
-        "Content-Disposition": _content_disposition("vlc-protocol.reg", "attachment")})
+    return ("Windows Registry Editor Version 5.00\r\n\r\n"
+            "[HKEY_CURRENT_USER\\Software\\Classes\\vlc]\r\n@=\"URL:VLC Protocol\"\r\n\"URL Protocol\"=\"\"\r\n\r\n"
+            "[HKEY_CURRENT_USER\\Software\\Classes\\vlc\\shell\\open\\command]\r\n"
+            f"@=\"{reg_cmd}\"\r\n")
+
+
+@router.get("/_ex/vlc-setup.reg")
+async def vlc_protocol_reg(path: str = DEFAULT_VLC_PATH, _: bool = Depends(require_auth)):
+    return Response(content=build_vlc_reg(path), media_type="application/octet-stream", headers={
+        "Content-Disposition": _content_disposition("vlc-setup.reg", "attachment")})
 
 
 #----- Raw bytes (range-capable) ---------------------------------------------------------------------------
-@router.get("/explorer/stream/{fid}/{name}")
-@router.head("/explorer/stream/{fid}/{name}")
+@router.get("/_ex/stream/{fid}/{name}")
+@router.head("/_ex/stream/{fid}/{name}")
 async def stream_session(request: Request, fid: str, name: str, dl: int = 0, _: bool = Depends(require_auth)):
-    return await _serve_file(request, fid, "attachment" if dl else "inline")
+    return await _serve_file(request, fid, bool(dl))
 
 
-@router.get("/explorer/s/{exp}/{sig}/{fid}/{name}")
-@router.head("/explorer/s/{exp}/{sig}/{fid}/{name}")
+@router.get("/_ex/s/{exp}/{sig}/{fid}/{name}")
+@router.head("/_ex/s/{exp}/{sig}/{fid}/{name}")
 async def stream_signed(request: Request, exp: int, sig: str, fid: str, name: str, dl: int = 0):
     if not verify_link(fid, exp, sig):
         raise HTTPException(status_code=403, detail="Link expired or invalid")
-    return await _serve_file(request, fid, "attachment" if dl else "inline")
+    return await _serve_file(request, fid, bool(dl))
 
 
 #----- Thumbnails + previews -----------------------------------------------------------------------------------------
-@router.get("/explorer/thumb/{fid}")
+@router.get("/_ex/thumb/{fid}")
 async def thumb(fid: str, _: bool = Depends(require_auth)):
     doc = await _doc_or_404(fid)
     data = _thumb_cache.get(fid)
@@ -353,13 +363,30 @@ async def text_preview(fid: str, _: bool = Depends(require_auth)):
     return {"text": data[:_TEXT_PREVIEW_BYTES].decode("utf-8", "replace"), "truncated": truncated}
 
 
+#----- Pages: keep these LAST. /explorer and /explorer/<anything> serve the same single-page app; the browser-side
+#----- router turns the path into a view (e.g. /explorer/Movies/2024 -> virtual folder Movies > 2024).
+def _page(request: Request):
+    ctx = _base_context(request)
+    ctx["current_user"] = get_current_user(request)
+    return templates.TemplateResponse("explorer.html", ctx)
+
+
+@router.get("/explorer", response_class=HTMLResponse)
+async def explorer_page(request: Request, _: bool = Depends(require_auth)):
+    return _page(request)
+
+
+@router.get("/explorer/{path:path}", response_class=HTMLResponse)
+async def explorer_page_path(path: str, request: Request, _: bool = Depends(require_auth)):
+    return _page(request)
+
+
 #----- Startup hook (called from main.py) -----------------------------------------------------------------------------
 async def explorer_startup() -> None:
     try:
         await get_store().ensure_indexes()
     except Exception as e:
         LOGGER.warning(f"[Explorer] startup index check failed: {e}")
-    import os
     if os.getenv("EXPLORER_AUTO_SYNC", "false").lower() == "true":
         async def _delayed():
             await asyncio.sleep(60)
