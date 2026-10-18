@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en" data-server-dark="{{ 1 if theme.is_dark else 0 }}">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>File Explorer · Telegram Stremio</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='{{ theme.colors.primary | replace('#','%23') }}'/%3E%3Cpath d='M6 11h7l2 2h11v10H6z' fill='white'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"/>
+<style>
+:root{
+  --accent: {{ theme.colors.primary }};
+  --bg:#f3f3f3; --pane:#fbfbfb; --card:#ffffff; --hover:rgba(0,0,0,.05); --sel:rgba(0,0,0,.09);
+  --text:#1b1b1b; --muted:#6b6b6b; --line:rgba(0,0,0,.09); --shadow:0 8px 28px rgba(0,0,0,.16);
+  --sel-bg: color-mix(in srgb, var(--accent) 16%, transparent);
+  color-scheme: light;
+}
+:root[data-theme="dark"]{
+  --bg:#202020; --pane:#272727; --card:#2d2d2d; --hover:rgba(255,255,255,.07); --sel:rgba(255,255,255,.12);
+  --text:#f2f2f2; --muted:#a0a0a0; --line:rgba(255,255,255,.1); --shadow:0 8px 28px rgba(0,0,0,.5);
+  color-scheme: dark;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font-family:'Segoe UI Variable','Segoe UI',system-ui,-apple-system,Inter,sans-serif;background:var(--bg);color:var(--text);font-size:14px;overflow:hidden;
+  padding-top:env(safe-area-inset-top,0);padding-bottom:env(safe-area-inset-bottom,0)}
+button,input,select{font:inherit;color:inherit}
+button{background:none;border:0;cursor:pointer}
+.app{display:grid;grid-template-rows:auto auto 1fr auto;height:100%}
+.row{display:flex;align-items:center;gap:6px}
+.btn{height:34px;min-width:34px;padding:0 10px;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;gap:8px;white-space:nowrap}
+.btn:hover:not(:disabled){background:var(--hover)} .btn:disabled{opacity:.35;cursor:default}
+.btn.primary{background:var(--accent);color:#fff} .btn.primary:hover{filter:brightness(1.1);background:var(--accent)}
+.btn.active{background:var(--sel)}
+.sep{width:1px;height:20px;background:var(--line);margin:0 4px}
+/* top bar */
+.top{padding:8px 10px 4px;gap:8px}
+.addr{flex:1;min-width:0;height:36px;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:0 8px;overflow:hidden}
+.crumbs{display:flex;align-items:center;gap:2px;overflow-x:auto;white-space:nowrap;scrollbar-width:none;flex:1}
+.crumbs::-webkit-scrollbar{display:none}
+.crumb{padding:3px 7px;border-radius:5px} .crumb:hover{background:var(--hover)}
+.chev{color:var(--muted);font-size:10px}
+.search{position:relative;width:min(300px,34vw)}
+.search input{width:100%;height:36px;border-radius:6px;border:1px solid var(--line);background:var(--card);padding:0 32px 0 12px;outline:none}
+.search input:focus{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.search i{position:absolute;right:11px;top:11px;color:var(--muted);pointer-events:none;font-size:12px}
+/* command bar */
+.cmd{padding:2px 10px 6px;gap:2px;overflow-x:auto;scrollbar-width:none}
+.cmd::-webkit-scrollbar{display:none}
+.cmd select{height:30px;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:0 6px;max-width:150px}
+/* body */
+.main{display:grid;grid-template-columns:240px 1fr auto;min-height:0;border-top:1px solid var(--line)}
+.nav{background:var(--pane);border-right:1px solid var(--line);overflow:auto;padding:8px 6px}
+.nav h6{margin:14px 10px 4px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600;display:flex;justify-content:space-between;align-items:center}
+.ni{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:6px;cursor:pointer;position:relative;user-select:none}
+.ni:hover{background:var(--hover)} .ni.active{background:var(--sel)}
+.ni.active::before{content:"";position:absolute;left:0;top:9px;bottom:9px;width:3px;border-radius:2px;background:var(--accent)}
+.ni i.ic{width:18px;text-align:center;color:var(--accent)}
+.ni .n{margin-left:auto;color:var(--muted);font-size:12px}
+.ni .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ni.drop{outline:2px dashed var(--accent);outline-offset:-2px}
+.tw{width:14px;text-align:center;color:var(--muted);font-size:10px;cursor:pointer}
+.content{overflow:auto;position:relative;background:var(--bg)}
+.pad{padding:14px 16px 40px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}
+.card{border-radius:8px;padding:8px;cursor:pointer;border:1px solid transparent;position:relative;user-select:none}
+.card:hover{background:var(--hover)} .card.sel{background:var(--sel-bg);border-color:var(--accent)}
+.card.drop{outline:2px dashed var(--accent)}
+.thumb{aspect-ratio:16/10;border-radius:6px;background:var(--card);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;overflow:hidden;position:relative}
+.thumb img{width:100%;height:100%;object-fit:cover}
+.thumb .big{font-size:34px;color:var(--accent);opacity:.9}
+.thumb .badge{position:absolute;right:5px;bottom:5px;background:rgba(0,0,0,.7);color:#fff;font-size:11px;padding:1px 6px;border-radius:4px}
+.thumb .ext{position:absolute;left:5px;top:5px;background:rgba(0,0,0,.55);color:#fff;font-size:10px;padding:1px 5px;border-radius:4px;text-transform:uppercase}
+.star{position:absolute;left:12px;bottom:46px;color:#f5b301;text-shadow:0 1px 3px rgba(0,0,0,.6);font-size:13px}
+.nm{margin-top:7px;line-height:1.25;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;font-size:13px}
+.mt{color:var(--muted);font-size:11.5px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.folder-tile .thumb{background:transparent;border:0}
+.folder-tile .thumb .big{font-size:58px;color:#f4c23d}
+table{width:100%;border-collapse:collapse}
+th{position:sticky;top:0;background:var(--bg);text-align:left;font-weight:500;color:var(--muted);padding:8px 10px;border-bottom:1px solid var(--line);cursor:pointer;white-space:nowrap;z-index:2}
+th:hover{background:var(--hover)}
+td{padding:7px 10px;border-bottom:1px solid transparent;white-space:nowrap;max-width:46vw;overflow:hidden;text-overflow:ellipsis}
+tr.fr{cursor:pointer;user-select:none} tr.fr:hover td{background:var(--hover)} tr.fr.sel td{background:var(--sel-bg)}
+tr.fr.drop td{outline:1px dashed var(--accent)}
+td.name i{margin-right:10px;color:var(--accent);width:16px;text-align:center}
+.sec{margin:6px 0 10px;font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px}
+.sec small{color:var(--muted);font-weight:400}
+.chcards{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px;margin-bottom:22px}
+.chcard{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px;cursor:pointer;display:flex;gap:12px;align-items:center}
+.chcard:hover{border-color:var(--accent)}
+.chcard i{font-size:22px;color:var(--accent)}
+.empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--muted);text-align:center;padding:30px}
+.empty i{font-size:56px;opacity:.35}
+/* details */
+.details{width:300px;background:var(--pane);border-left:1px solid var(--line);overflow:auto;padding:14px;display:none}
+.details.open{display:block}
+.details .pv{aspect-ratio:16/10;border-radius:8px;background:var(--card);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;overflow:hidden;margin-bottom:12px}
+.details .pv img{width:100%;height:100%;object-fit:cover} .details .pv i{font-size:48px;color:var(--accent)}
+.details h3{margin:0 0 10px;font-size:15px;word-break:break-word}
+.kv{display:grid;grid-template-columns:90px 1fr;gap:6px 8px;font-size:12.5px}
+.kv div:nth-child(odd){color:var(--muted)} .kv div:nth-child(even){word-break:break-word}
+.acts{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}
+.acts .btn{border:1px solid var(--line);height:30px;font-size:12.5px}
+/* status */
+.status{padding:4px 12px;border-top:1px solid var(--line);color:var(--muted);font-size:12px;display:flex;gap:14px;align-items:center;min-height:28px}
+.bar{height:4px;width:120px;background:var(--line);border-radius:3px;overflow:hidden}
+.bar>i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s}
+/* menus / dialogs */
+.menu{position:fixed;z-index:60;min-width:210px;background:var(--card);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);padding:4px}
+.menu .mi{padding:7px 12px;border-radius:5px;cursor:pointer;display:flex;gap:10px;align-items:center}
+.menu .mi:hover{background:var(--hover)} .menu .mi i{width:16px;text-align:center;color:var(--muted)}
+.menu hr{border:0;border-top:1px solid var(--line);margin:4px 2px}
+.scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:70;display:flex;align-items:center;justify-content:center;padding:16px}
+.dlg{background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);width:min(440px,100%);max-height:86vh;overflow:auto;padding:18px}
+.dlg h4{margin:0 0 12px;font-size:16px}
+.dlg input[type=text]{width:100%;height:36px;border-radius:6px;border:1px solid var(--line);background:var(--bg);padding:0 10px;outline:none}
+.dlg input[type=text]:focus{border-color:var(--accent)}
+.dlg .ft{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+.dlg p{color:var(--muted);line-height:1.5;margin:8px 0}
+.toast{position:fixed;left:50%;bottom:34px;transform:translateX(-50%);background:var(--card);border:1px solid var(--line);box-shadow:var(--shadow);padding:10px 16px;border-radius:8px;z-index:90}
+/* viewer / player */
+.viewer{position:fixed;inset:0;z-index:80;background:rgba(0,0,0,.92);display:flex;flex-direction:column;color:#fff;padding-top:env(safe-area-inset-top,0)}
+.vtop{display:flex;align-items:center;gap:8px;padding:10px 14px;flex-wrap:wrap}
+.vtop .ttl{flex:1;min-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}
+.vtop .btn{color:#fff;border:1px solid rgba(255,255,255,.2);height:32px}
+.vtop .btn:hover{background:rgba(255,255,255,.14)!important}
+.modechip{font-size:11.5px;padding:2px 8px;border-radius:99px;background:rgba(255,255,255,.14)}
+.stage{flex:1;min-height:0;position:relative;display:flex;align-items:center;justify-content:center}
+.stage video,.stage audio{max-width:100%;max-height:100%;width:100%;height:100%;background:#000;outline:none}
+.stage audio{height:60px;width:min(560px,92%)}
+.stage img{max-width:100%;max-height:100%;object-fit:contain}
+.stage iframe{width:100%;height:100%;border:0;background:#fff}
+.stage pre{margin:0;padding:18px;overflow:auto;width:100%;height:100%;font:13px/1.5 Consolas,monospace;white-space:pre-wrap;word-break:break-word;color:#e8e8e8}
+.overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;text-align:center;padding:20px;background:rgba(0,0,0,.72)}
+.overlay .btn{border:1px solid rgba(255,255,255,.3);color:#fff}
+.spin{width:38px;height:38px;border:4px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:sp 1s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.ctl{display:flex;align-items:center;gap:8px;padding:8px 14px 14px;flex-wrap:wrap}
+.ctl .btn{color:#fff} .ctl .btn:hover{background:rgba(255,255,255,.14)!important}
+.ctl input[type=range]{accent-color:var(--accent);height:4px}
+.ctl .seek{flex:1;min-width:140px} .ctl .vol{width:84px}
+.ctl .tm{font-variant-numeric:tabular-nums;font-size:12.5px;min-width:100px;text-align:center}
+.ctl select{background:rgba(255,255,255,.12);color:#fff;border:0;border-radius:5px;height:28px}
+.ctl select option{color:#000}
+.vnote{padding:0 14px 8px;color:rgba(255,255,255,.65);font-size:12px}
+/* mobile */
+.burger{display:none}
+@media (max-width:820px){
+  .main{grid-template-columns:1fr}
+  .nav{position:fixed;left:0;top:0;bottom:0;width:260px;z-index:55;transform:translateX(-102%);transition:transform .2s;box-shadow:var(--shadow);padding-top:calc(10px + env(safe-area-inset-top,0))}
+  .nav.open{transform:none}
+  .burger{display:inline-flex}
+  .search{width:100%}
+  .top{flex-wrap:wrap}
+  .addr{order:3;flex-basis:100%}
+  .details{position:fixed;right:0;top:0;bottom:0;width:min(320px,92vw);z-index:56;box-shadow:var(--shadow)}
+  .grid{grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}
+  td.hm,th.hm{display:none}
+  .pad{padding:10px 8px 40px}
+}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <div class="row top">
+    <button class="btn burger" id="burger" title="Menu"><i class="fa-solid fa-bars"></i></button>
+    <button class="btn" id="back" title="Back"><i class="fa-solid fa-arrow-left"></i></button>
+    <button class="btn" id="fwd" title="Forward"><i class="fa-solid fa-arrow-right"></i></button>
+    <button class="btn" id="up" title="Up"><i class="fa-solid fa-arrow-up"></i></button>
+    <button class="btn" id="refresh" title="Refresh"><i class="fa-solid fa-rotate-right"></i></button>
+    <div class="addr row"><i class="fa-solid fa-folder-open" style="color:var(--accent)"></i><div class="crumbs" id="crumbs"></div></div>
+    <div class="search"><input id="q" type="search" placeholder="Search files" autocomplete="off"><i class="fa-solid fa-magnifying-glass"></i></div>
+  </div>
+  <div class="row cmd">
+    <button class="btn" id="newFolder"><i class="fa-solid fa-folder-plus" style="color:#f4c23d"></i> New folder</button>
+    <span class="sep"></span>
+    <button class="btn" id="sortBtn"><i class="fa-solid fa-arrow-up-wide-short"></i> <span id="sortLbl">Sort</span></button>
+    <button class="btn" id="viewBtn"><i class="fa-solid fa-table-cells-large" id="viewIc"></i> View</button>
+    <span class="sep"></span>
+    <select id="fKind" title="Filter by type"><option value="">All types</option></select>
+    <select id="fChan" title="Filter by source channel"><option value="">All channels</option></select>
+    <span class="sep"></span>
+    <button class="btn" id="syncBtn" title="Index new files from your Telegram channels"><i class="fa-solid fa-arrows-rotate"></i> <span>Sync</span></button>
+    <button class="btn" id="detBtn" title="Details pane"><i class="fa-solid fa-table-columns"></i> Details</button>
+    <span style="flex:1"></span>
+    <button class="btn" id="themeBtn" title="Toggle dark mode"><i class="fa-solid fa-circle-half-stroke"></i></button>
+    <a class="btn" href="/" title="Back to admin dashboard" style="text-decoration:none"><i class="fa-solid fa-gauge"></i> Admin</a>
+  </div>
+  <div class="main">
+    <aside class="nav" id="nav"></aside>
+    <section class="content" id="content" tabindex="0"></section>
+    <aside class="details" id="details"></aside>
+  </div>
+  <div class="status"><span id="stCount"></span><span id="stSel"></span><span style="flex:1"></span><span id="stSync"></span></div>
+</div>
+
+{% raw %}
+<script>
+(() => {
+'use strict';
+const $ = (s, r = document) => r.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const enc = encodeURIComponent;
+const KINDS = [['video','Videos','fa-film'],['audio','Audio','fa-music'],['image','Images','fa-image'],['document','Documents','fa-file-lines'],['archive','Archives','fa-file-zipper'],['subtitle','Subtitles','fa-closed-captioning'],['other','Other','fa-file']];
+const KICON = Object.fromEntries(KINDS.map(k => [k[0], k[2]]));
+const KNAME = Object.fromEntries(KINDS.map(k => [k[0], k[1]]));
+const PAGE = 60;
+
+// ---------- state ----------
+const S = {
+  view: {t: 'home'},            // home | all | kind | fav | folders | folder | channel
+  hist: [], hi: -1,
+  items: [], total: 0, page: 0, loading: false, done: false,
+  sort: localStorage.getItem('ex.sort') || 'date', order: localStorage.getItem('ex.order') || 'desc',
+  mode: localStorage.getItem('ex.mode') || 'grid',
+  q: '', kind: '', chan: '',
+  sel: new Set(), last: null,
+  sum: null, folders: [], expanded: new Set(JSON.parse(localStorage.getItem('ex.exp') || '[]')),
+  detOpen: localStorage.getItem('ex.det') === '1', gen: 0, syncPoll: null
+};
+
+// ---------- api ----------
+async function api(url, opt = {}) {
+  const o = Object.assign({credentials: 'same-origin'}, opt);
+  if (o.body && typeof o.body !== 'string') { o.body = JSON.stringify(o.body); o.headers = Object.assign({'Content-Type': 'application/json'}, o.headers); }
+  const r = await fetch(url, o);
+  if (r.redirected && r.url.includes('/login')) { location.href = '/login'; throw new Error('Session expired'); }
+  if (!r.ok) { let m = r.statusText; try { const j = await r.json(); m = j.detail || j.error || m; } catch (e) {} const err = new Error(m); err.status = r.status; throw err; }
+  return r.json();
+}
+function toast(msg, ms = 2600) { const t = document.createElement('div'); t.className = 'toast'; t.textContent = msg; document.body.appendChild(t); setTimeout(() => t.remove(), ms); }
+const fmtSize = n => { n = +n || 0; if (!n) return '—'; const u = ['B','KB','MB','GB','TB']; let i = 0; while (n >= 1024 && i < 4) { n /= 1024; i++; } return (i ? n.toFixed(n >= 100 ? 0 : 1) : n) + ' ' + u[i]; };
+const fmtDate = s => s ? new Date(s).toLocaleString([], {year:'numeric', month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}) : '—';
+const fmtDur = s => { s = Math.max(0, Math.floor(+s || 0)); const h = Math.floor(s/3600), m = Math.floor(s%3600/60), x = s%60; return (h ? h + ':' + String(m).padStart(2,'0') : m) + ':' + String(x).padStart(2,'0'); };
+const byId = id => S.items.find(i => i.id === id);
+
+// ---------- theme ----------
+function applyTheme() {
+  const pref = localStorage.getItem('ex.theme') || 'auto';
+  const dark = pref === 'dark' || (pref === 'auto' && (document.documentElement.dataset.serverDark === '1' || matchMedia('(prefers-color-scheme: dark)').matches));
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+}
+$('#themeBtn').onclick = () => { const cur = document.documentElement.dataset.theme; localStorage.setItem('ex.theme', cur === 'dark' ? 'light' : 'dark'); applyTheme(); };
+applyTheme();
+
+// ---------- navigation ----------
+function viewKey(v) { return JSON.stringify(v); }
+function go(v, push = true) {
+  S.view = v; S.sel.clear(); S.last = null;
+  if (push) { S.hist = S.hist.slice(0, S.hi + 1); S.hist.push(v); S.hi = S.hist.length - 1; }
+  if (S.q) { /* keep search scope */ }
+  $('#nav').classList.remove('open');
+  renderNav(); load(true);
+}
+$('#back').onclick = () => { if (S.hi > 0) { S.hi--; go(S.hist[S.hi], false); } };
+$('#fwd').onclick = () => { if (S.hi < S.hist.length - 1) { S.hi++; go(S.hist[S.hi], false); } };
+$('#up').onclick = () => {
+  const v = S.view;
+  if (v.t === 'folder') { const f = S.folders.find(x => x.id === v.id); go(f && f.parent_id ? {t: 'folder', id: f.parent_id} : {t: 'folders'}); }
+  else if (v.t !== 'home') go({t: 'home'});
+};
+$('#refresh').onclick = () => { refreshSummary().then(() => load(true)); };
+$('#burger').onclick = () => $('#nav').classList.toggle('open');
+
+function folderPath(id) { const out = []; let cur = S.folders.find(f => f.id === id); while (cur) { out.unshift(cur); cur = S.folders.find(f => f.id === cur.parent_id); } return out; }
+
+function renderCrumbs() {
+  const v = S.view, parts = [['This PC', {t: 'home'}]];
+  if (v.t === 'all') parts.push(['All Files', v]);
+  else if (v.t === 'kind') parts.push([KNAME[v.k], v]);
+  else if (v.t === 'fav') parts.push(['Favorites', v]);
+  else if (v.t === 'channel') parts.push([(S.sum?.channels.find(c => c.chat_id === v.id)?.name) || 'Channel', v]);
+  else if (v.t === 'folders') parts.push(['Folders', v]);
+  else if (v.t === 'folder') { parts.push(['Folders', {t: 'folders'}]); folderPath(v.id).forEach(f => parts.push([f.name, {t: 'folder', id: f.id}])); }
+  if (S.q) parts.push(['Search: “' + S.q + '”', null]);
+  $('#crumbs').innerHTML = parts.map((p, i) => (i ? '<i class="fa-solid fa-chevron-right chev"></i>' : '') + `<span class="crumb" data-i="${i}">${esc(p[0])}</span>`).join('');
+  $('#crumbs').querySelectorAll('.crumb').forEach(el => el.onclick = () => { const t = parts[+el.dataset.i][1]; if (t) { S.q = ''; $('#q').value = ''; go(t); } });
+  $('#up').disabled = v.t === 'home';
+  $('#back').disabled = S.hi <= 0; $('#fwd').disabled = S.hi >= S.hist.length - 1;
+}
+
+// ---------- sidebar ----------
+function ni(label, icon, active, attrs = '', count = '', extra = '') {
+  return `<div class="ni ${active ? 'active' : ''}" ${attrs}>${extra}<i class="fa-solid ${icon} ic"></i><span class="t">${esc(label)}</span>${count !== '' ? `<span class="n">${count}</span>` : ''}</div>`;
+}
+function folderNodes(parent, depth) {
+  return S.folders.filter(f => (f.parent_id || null) === parent).map(f => {
+    const kids = S.folders.some(x => x.parent_id === f.id), open = S.expanded.has(f.id);
+    const active = S.view.t === 'folder' && S.view.id === f.id;
+    return `<div class="ni ${active ? 'active' : ''}" data-folder="${f.id}" style="padding-left:${10 + depth * 14}px">
+      <span class="tw" data-tw="${f.id}">${kids ? `<i class="fa-solid fa-chevron-${open ? 'down' : 'right'}"></i>` : ''}</span>
+      <i class="fa-solid ${open && kids ? 'fa-folder-open' : 'fa-folder'} ic" style="color:#f4c23d"></i><span class="t">${esc(f.name)}</span><span class="n">${f.count || ''}</span></div>` + (open ? folderNodes(f.id, depth + 1) : '');
+  }).join('');
+}
+function renderNav() {
+  const sum = S.sum, v = S.view, k = sum ? sum.kinds : {};
+  let h = ni('Home', 'fa-house', v.t === 'home', 'data-go="home"');
+  h += ni('All Files', 'fa-layer-group', v.t === 'all', 'data-go="all"', sum ? sum.total : '');
+  h += '<h6>Libraries</h6>';
+  KINDS.forEach(([key, name, ic]) => { h += ni(name, ic, v.t === 'kind' && v.k === key, `data-kind="${key}"`, k[key] || 0); });
+  h += ni('Favorites', 'fa-star', v.t === 'fav', 'data-go="fav"', sum ? sum.favorites : '');
+  h += `<h6><span>Folders</span><span class="btn" style="height:22px;min-width:22px;padding:0" id="navNew" title="New folder"><i class="fa-solid fa-plus"></i></span></h6>`;
+  h += ni('All folders', 'fa-folder-tree', v.t === 'folders', 'data-go="folders"');
+  h += folderNodes(null, 0);
+  if (sum && sum.channels.length) { h += '<h6>Telegram channels</h6>'; sum.channels.forEach(c => { h += ni(c.name, 'fa-paper-plane', v.t === 'channel' && v.id === c.chat_id, `data-chan="${c.chat_id}"`, c.count); }); }
+  $('#nav').innerHTML = h;
+  const nav = $('#nav');
+  nav.querySelectorAll('[data-go]').forEach(e => e.onclick = () => { S.q = ''; $('#q').value = ''; go({t: e.dataset.go}); });
+  nav.querySelectorAll('[data-kind]').forEach(e => e.onclick = () => { S.q = ''; $('#q').value = ''; go({t: 'kind', k: e.dataset.kind}); });
+  nav.querySelectorAll('[data-chan]').forEach(e => e.onclick = () => go({t: 'channel', id: +e.dataset.chan}));
+  nav.querySelectorAll('[data-folder]').forEach(e => {
+    e.onclick = ev => { if (ev.target.closest('.tw')) return; go({t: 'folder', id: e.dataset.folder}); };
+    e.oncontextmenu = ev => { ev.preventDefault(); folderMenu(ev, e.dataset.folder); };
+    dropTarget(e, () => e.dataset.folder);
+  });
+  nav.querySelectorAll('[data-tw]').forEach(e => e.onclick = ev => { ev.stopPropagation(); const id = e.dataset.tw; S.expanded.has(id) ? S.expanded.delete(id) : S.expanded.add(id); localStorage.setItem('ex.exp', JSON.stringify([...S.expanded])); renderNav(); });
+  const nn = $('#navNew'); if (nn) nn.onclick = () => newFolder(S.view.t === 'folder' ? S.view.id : null);
+  const fd = nav.querySelector('[data-go="folders"]'); if (fd) dropTarget(fd, () => '');
+  renderCrumbs();
+  // filters
+  const fk = $('#fKind'); if (fk.options.length <= 1) KINDS.forEach(([key, name]) => fk.add(new Option(name, key)));
+  const fc = $('#fChan'); const cur = fc.value; fc.length = 1; (sum?.channels || []).forEach(c => fc.add(new Option(c.name, c.chat_id))); fc.value = cur;
+}
+
+// ---------- drag & drop (move references between virtual folders) ----------
+function dropTarget(el, getFolder) {
+  el.addEventListener('dragover', e => { if (e.dataTransfer.types.includes('text/x-explorer')) { e.preventDefault(); el.classList.add('drop'); } });
+  el.addEventListener('dragleave', () => el.classList.remove('drop'));
+  el.addEventListener('drop', async e => {
+    el.classList.remove('drop'); const raw = e.dataTransfer.getData('text/x-explorer'); if (!raw) return; e.preventDefault();
+    await moveFiles(JSON.parse(raw), getFolder() || null);
+  });
+}
+function dragStart(e, id) {
+  if (!S.sel.has(id)) { S.sel = new Set([id]); paintSel(); }
+  e.dataTransfer.setData('text/x-explorer', JSON.stringify([...S.sel])); e.dataTransfer.effectAllowed = 'move';
+}
+async function moveFiles(ids, folderId) {
+  try { const r = await api('/api/explorer/move', {method: 'POST', body: {file_ids: ids, folder_id: folderId}}); toast(`Moved ${r.moved} reference${r.moved === 1 ? '' : 's'} (Telegram files untouched)`); await refreshSummary(); load(true); }
+  catch (e) { toast(e.message); }
+}
+
+// ---------- data loading ----------
+async function refreshSummary() {
+  try { S.sum = await api('/api/explorer/summary'); S.folders = S.sum.folders; renderNav(); updateSyncUI(S.sum.status); if (S.sum.status.running) pollSync(); }
+  catch (e) { toast(e.message); }
+}
+function queryFor(page) {
+  const v = S.view, p = new URLSearchParams({sort: S.sort, order: S.order, page, limit: PAGE});
+  if (v.t === 'kind') p.set('kind', v.k);
+  if (v.t === 'fav') p.set('fav', 'true');
+  if (v.t === 'folder') p.set('folder', v.id);
+  if (v.t === 'channel') p.set('channel', v.id);
+  if (S.kind && v.t !== 'kind') p.set('kind', S.kind);
+  if (S.chan && v.t !== 'channel') p.set('channel', S.chan);
+  if (S.q) p.set('q', S.q);
+  return p.toString();
+}
+function subfolders() {
+  const v = S.view; if (S.q) return [];
+  if (v.t === 'folders') return S.folders.filter(f => !f.parent_id);
+  if (v.t === 'folder') return S.folders.filter(f => f.parent_id === v.id);
+  return [];
+}
+async function load(reset) {
+  const gen = ++S.gen;
+  if (reset) { S.items = []; S.total = 0; S.page = 0; S.done = false; S.loading = false; }
+  if (S.view.t === 'home' && !S.q) return renderHome();
+  if (S.view.t === 'folders' && !S.q) { S.done = true; return render(); }
+  if (S.loading || S.done) return;
+  S.loading = true;
+  try {
+    const r = await api('/api/explorer/files?' + queryFor(S.page + 1));
+    if (gen !== S.gen) return;
+    S.page = r.page; S.total = r.total; S.items = S.items.concat(r.items); S.done = S.items.length >= r.total;
+  } catch (e) { if (gen === S.gen) toast(e.message); }
+  S.loading = false; if (gen === S.gen) render();
+}
+
+// ---------- rendering ----------
+function iconFor(i) { return KICON[i.kind] || 'fa-file'; }
+function thumbHtml(i) {
+  const dur = i.kind === 'video' && i.duration ? `<span class="badge">${fmtDur(i.duration)}</span>` : '';
+  const ext = i.ext ? `<span class="ext">${esc(i.ext)}</span>` : '';
+  const img = i.has_thumb ? `<img loading="lazy" src="/explorer/thumb/${i.id}" onerror="this.remove()">` : '';
+  return `<div class="thumb"><i class="fa-solid ${iconFor(i)} big"></i>${img}${ext}${dur}</div>`;
+}
+function renderHome() {
+  const c = $('#content');
+  if (!S.sum) { c.innerHTML = '<div class="empty"><div class="spin" style="border-color:var(--line);border-top-color:var(--accent)"></div></div>'; return; }
+  if (!S.sum.total) { c.innerHTML = emptyIndex(); bindEmpty(); counts(); return; }
+  c.innerHTML = '<div class="pad" id="homePad"></div>';
+  const pad = $('#homePad');
+  const chs = S.sum.channels.map(ch => `<div class="chcard" data-chan="${ch.chat_id}"><i class="fa-brands fa-telegram"></i><div style="min-width:0"><div class="t" style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(ch.name)}</div><div class="mt">${ch.count} files · ${fmtSize(ch.size)}</div></div></div>`).join('');
+  const quick = KINDS.filter(k => (S.sum.kinds[k[0]] || 0) > 0).map(k => `<div class="chcard" data-kind="${k[0]}"><i class="fa-solid ${k[2]}"></i><div><div style="font-weight:600">${k[1]}</div><div class="mt">${S.sum.kinds[k[0]]} files</div></div></div>`).join('');
+  const fl = S.folders.filter(f => !f.parent_id).map(f => folderTile(f)).join('');
+  pad.innerHTML = `<div class="sec">Quick access</div><div class="chcards">${quick}</div>
+    ${chs ? `<div class="sec">Telegram channels</div><div class="chcards">${chs}</div>` : ''}
+    ${fl ? `<div class="sec">Folders</div><div class="grid" style="margin-bottom:22px">${fl}</div>` : ''}
+    <div class="sec">Recent files <small>newest first</small></div><div class="grid" id="recent"></div>
+    <div class="sec" id="favSec" style="margin-top:22px;display:none">Favorites</div><div class="grid" id="favs"></div>`;
+  pad.querySelectorAll('[data-chan]').forEach(e => e.onclick = () => go({t: 'channel', id: +e.dataset.chan}));
+  pad.querySelectorAll('[data-kind]').forEach(e => e.onclick = () => go({t: 'kind', k: e.dataset.kind}));
+  bindFolderTiles(pad);
+  const gen = S.gen;
+  api('/api/explorer/files?sort=date&order=desc&limit=12').then(r => { if (gen !== S.gen) return; S.items = r.items.slice(); fillGrid($('#recent'), r.items); });
+  api('/api/explorer/files?fav=true&limit=12&sort=date&order=desc').then(r => { if (gen !== S.gen || !r.items.length) return; $('#favSec').style.display = ''; S.items = S.items.concat(r.items); fillGrid($('#favs'), r.items); });
+  counts();
+}
+function fillGrid(el, items) { el.innerHTML = items.map(cardHtml).join(''); bindItems(el); }
+function folderTile(f) { return `<div class="card folder-tile" data-folder="${f.id}"><div class="thumb"><i class="fa-solid fa-folder big"></i></div><div class="nm">${esc(f.name)}</div><div class="mt">${f.count} item${f.count === 1 ? '' : 's'}</div></div>`; }
+function bindFolderTiles(root) {
+  root.querySelectorAll('.folder-tile').forEach(e => {
+    e.ondblclick = () => go({t: 'folder', id: e.dataset.folder});
+    e.onclick = () => { if (matchMedia('(pointer:coarse)').matches) go({t: 'folder', id: e.dataset.folder}); };
+    e.oncontextmenu = ev => { ev.preventDefault(); folderMenu(ev, e.dataset.folder); };
+    dropTarget(e, () => e.dataset.folder);
+  });
+}
+function cardHtml(i) {
+  return `<div class="card ${S.sel.has(i.id) ? 'sel' : ''}" data-id="${i.id}" draggable="true">${thumbHtml(i)}${i.favorite ? '<i class="fa-solid fa-star star"></i>' : ''}<div class="nm" title="${esc(i.name)}">${esc(i.name)}</div><div class="mt">${fmtSize(i.size)} · ${new Date(i.date).toLocaleDateString()}</div></div>`;
+}
+function rowHtml(i) {
+  return `<tr class="fr ${S.sel.has(i.id) ? 'sel' : ''}" data-id="${i.id}" draggable="true"><td class="name" title="${esc(i.name)}"><i class="fa-solid ${iconFor(i)}"></i>${esc(i.name)}${i.favorite ? ' <i class="fa-solid fa-star" style="color:#f5b301;font-size:11px"></i>' : ''}</td><td class="hm">${fmtDate(i.date)}</td><td class="hm">${esc(i.ext ? i.ext.toUpperCase() + ' file' : KNAME[i.kind])}</td><td>${fmtSize(i.size)}</td><td class="hm">${esc(i.channel)}</td></tr>`;
+}
+function render() {
+  const c = $('#content'), folders = subfolders();
+  if (S.view.t === 'home' && !S.q) return renderHome();
+  if (!S.items.length && !folders.length && !S.loading) {
+    c.innerHTML = S.sum && !S.sum.total && !S.q ? emptyIndex() : `<div class="empty"><i class="fa-solid ${S.q ? 'fa-magnifying-glass' : 'fa-folder-open'}"></i><div>${S.q ? 'No files match your search' : (S.view.t === 'folder' || S.view.t === 'folders' ? 'This folder is empty — drag files here to organise them' : 'Nothing here yet')}</div></div>`;
+    bindEmpty(); counts(); return;
+  }
+  let h = '<div class="pad">';
+  if (S.mode === 'grid') {
+    if (folders.length) h += `<div class="grid" style="margin-bottom:14px">${folders.map(folderTile).join('')}</div>`;
+    h += `<div class="grid" id="items">${S.items.map(cardHtml).join('')}</div>`;
+  } else {
+    const th = (k, l, cls = '') => `<th class="${cls}" data-sort="${k}">${l}${S.sort === k ? ` <i class="fa-solid fa-chevron-${S.order === 'asc' ? 'up' : 'down'}" style="font-size:9px"></i>` : ''}</th>`;
+    h += `<table><thead><tr>${th('name', 'Name')}${th('date', 'Date', 'hm')}${th('type', 'Type', 'hm')}${th('size', 'Size')}<th class="hm">Source channel</th></tr></thead><tbody id="items">${folders.map(f => `<tr class="fr folder-tile" data-folder="${f.id}"><td class="name"><i class="fa-solid fa-folder" style="color:#f4c23d"></i>${esc(f.name)}</td><td class="hm">—</td><td class="hm">Folder</td><td>${f.count} items</td><td class="hm"></td></tr>`).join('')}${S.items.map(rowHtml).join('')}</tbody></table>`;
+  }
+  h += `<div id="more" style="padding:18px;text-align:center;color:var(--muted)">${S.done ? '' : (S.loading ? 'Loading…' : '<button class="btn" id="moreBtn">Load more</button>')}</div></div>`;
+  const st = c.scrollTop; c.innerHTML = h; c.scrollTop = st;
+  bindItems(c); bindFolderTiles(c);
+  c.querySelectorAll('th[data-sort]').forEach(t => t.onclick = () => setSort(t.dataset.sort));
+  const mb = $('#moreBtn'); if (mb) mb.onclick = () => load();
+  counts();
+}
+function emptyIndex() {
+  const running = S.sum && S.sum.status.running;
+  return `<div class="empty"><i class="fa-brands fa-telegram"></i><div style="font-size:16px;color:var(--text)">${running ? 'Indexing your Telegram channels…' : 'No files indexed yet'}</div><div>${running ? 'Files appear here as soon as they are found.' : 'Index your Telegram channels once and the Explorer will keep itself up to date.'}</div>${running ? '' : '<button class="btn primary" id="emptySync"><i class="fa-solid fa-arrows-rotate"></i> Index my channels</button>'}${S.sum && !S.sum.configured_channels.length ? '<div class="mt">No channels configured — add AUTH_CHANNEL in Settings first.</div>' : ''}</div>`;
+}
+function bindEmpty() { const b = $('#emptySync'); if (b) b.onclick = () => startSync(false); }
+function counts() {
+  const v = S.view; const total = v.t === 'home' ? (S.sum ? S.sum.total : 0) : S.total;
+  $('#stCount').textContent = v.t === 'home' ? `${total} files indexed` : `${S.items.length}${S.total > S.items.length ? ' of ' + S.total : ''} item${S.total === 1 ? '' : 's'}`;
+  const n = S.sel.size; $('#stSel').textContent = n ? `${n} selected` : '';
+  renderDetails();
+}
+// infinite scroll
+$('#content').addEventListener('scroll', e => { const c = e.target; if (!S.done && !S.loading && c.scrollTop + c.clientHeight > c.scrollHeight - 500) load(); });
+
+// ---------- selection / interaction ----------
+function paintSel() { document.querySelectorAll('[data-id]').forEach(e => e.classList.toggle('sel', S.sel.has(e.dataset.id))); counts(); }
+function bindItems(root) {
+  root.querySelectorAll('[data-id]').forEach(e => {
+    const id = e.dataset.id;
+    e.onclick = ev => {
+      if (ev.ctrlKey || ev.metaKey) { S.sel.has(id) ? S.sel.delete(id) : S.sel.add(id); }
+      else if (ev.shiftKey && S.last) { const ids = S.items.map(x => x.id), a = ids.indexOf(S.last), b = ids.indexOf(id); S.sel = new Set(ids.slice(Math.min(a, b), Math.max(a, b) + 1)); }
+      else { S.sel = new Set([id]); if (matchMedia('(pointer:coarse)').matches) { openItem(id); return; } }
+      S.last = id; paintSel();
+    };
+    e.ondblclick = () => openItem(id);
+    e.oncontextmenu = ev => { ev.preventDefault(); if (!S.sel.has(id)) { S.sel = new Set([id]); paintSel(); } fileMenu(ev, id); };
+    e.ondragstart = ev => dragStart(ev, id);
+  });
+}
+$('#content').addEventListener('click', e => { if (e.target.id === 'content' || e.target.classList.contains('pad')) { S.sel.clear(); paintSel(); } });
+document.addEventListener('keydown', e => {
+  if (e.target.matches('input,select,textarea') || document.querySelector('.viewer,.scrim')) return;
+  if (e.key === 'Enter' && S.sel.size === 1) openItem([...S.sel][0]);
+  if ((e.ctrlKey || e.metaKey) && e.key === 'a') { e.preventDefault(); S.sel = new Set(S.items.map(i => i.id)); paintSel(); }
+  if (e.key === 'Escape') { S.sel.clear(); paintSel(); closeMenu(); }
+  if (e.key === 'Backspace') $('#up').click();
+  if (e.key === '/') { e.preventDefault(); $('#q').focus(); }
+});
+
+// ---------- menus ----------
+function closeMenu() { document.querySelectorAll('.menu').forEach(m => m.remove()); }
+document.addEventListener('click', closeMenu); window.addEventListener('blur', closeMenu);
+function showMenu(ev, entries) {
+  closeMenu();
+  const m = document.createElement('div'); m.className = 'menu';
+  m.innerHTML = entries.map((x, i) => x === '-' ? '<hr>' : `<div class="mi" data-i="${i}"><i class="fa-solid ${x.icon || 'fa-circle'}"></i>${esc(x.label)}</div>`).join('');
+  document.body.appendChild(m);
+  const w = m.offsetWidth, h = m.offsetHeight;
+  m.style.left = Math.min(ev.clientX, innerWidth - w - 8) + 'px'; m.style.top = Math.min(ev.clientY, innerHeight - h - 8) + 'px';
+  m.querySelectorAll('.mi').forEach(el => el.onclick = e => { e.stopPropagation(); closeMenu(); entries[+el.dataset.i].fn(); });
+}
+function fileMenu(ev, id) {
+  const it = byId(id); if (!it) return; const ids = [...S.sel], multi = ids.length > 1;
+  const media = it.kind === 'video' || it.kind === 'audio';
+  const e = [{label: multi ? `Open ${ids.length} items` : (media ? 'Play in VLC' : 'Open'), icon: 'fa-play', fn: () => openItem(id)}];
+    if (!multi) e.push({label: 'Download', icon: 'fa-download', fn: () => download(it)}, {label: 'Copy stream link', icon: 'fa-link', fn: () => copyLink(it)});
+  e.push('-', {label: it.favorite ? 'Remove from favorites' : 'Add to favorites', icon: 'fa-star', fn: () => favorite(ids, !it.favorite)},
+    {label: 'Move to folder…', icon: 'fa-folder-open', fn: () => moveDialog(ids)});
+  if (it.folder_id) e.push({label: 'Remove from folder', icon: 'fa-folder-minus', fn: () => moveFiles(ids, null)});
+  if (!multi) e.push('-', {label: 'Properties', icon: 'fa-circle-info', fn: () => { S.detOpen = true; localStorage.setItem('ex.det', '1'); renderDetails(); }});
+  showMenu(ev, e);
+}
+function folderMenu(ev, id) {
+  showMenu(ev, [{label: 'Open', icon: 'fa-folder-open', fn: () => go({t: 'folder', id})},
+    {label: 'New subfolder', icon: 'fa-folder-plus', fn: () => newFolder(id)},
+    {label: 'Rename', icon: 'fa-pen', fn: () => renameFolder(id)}, '-',
+    {label: 'Delete folder', icon: 'fa-trash', fn: () => deleteFolder(id)}]);
+}
+
+// ---------- dialogs ----------
+function dialog({title, body = '', ok = 'OK', cancel = 'Cancel', input = null, danger = false}) {
+  return new Promise(res => {
+    const s = document.createElement('div'); s.className = 'scrim';
+    s.innerHTML = `<div class="dlg"><h4>${esc(title)}</h4>${body}${input !== null ? `<input type="text" id="dlgIn" value="${esc(input)}" maxlength="120">` : ''}<div class="ft">${cancel ? `<button class="btn" id="dlgNo">${esc(cancel)}</button>` : ''}<button class="btn primary" id="dlgOk" ${danger ? 'style="background:#d13438"' : ''}>${esc(ok)}</button></div></div>`;
+    document.body.appendChild(s);
+    const done = v => { s.remove(); res(v); };
+    const inp = $('#dlgIn', s); if (inp) { inp.focus(); inp.select(); inp.onkeydown = e => { if (e.key === 'Enter') done(inp.value); if (e.key === 'Escape') done(null); }; }
+    $('#dlgOk', s).onclick = () => done(inp ? inp.value : true);
+    const no = $('#dlgNo', s); if (no) no.onclick = () => done(null);
+    s.onclick = e => { if (e.target === s) done(null); };
+    s._done = done;
+  });
+}
+async function newFolder(parent) {
+  const name = await dialog({title: parent ? 'New subfolder' : 'New folder', input: 'New folder', ok: 'Create'});
+  if (!name) return;
+  try { const f = await api('/api/explorer/folders', {method: 'POST', body: {name, parent_id: parent || null}}); if (parent) { S.expanded.add(parent); localStorage.setItem('ex.exp', JSON.stringify([...S.expanded])); } await refreshSummary(); toast(`Created “${f.name}”`); if (S.view.t === 'folders' || S.view.t === 'folder' || S.view.t === 'home') load(true); }
+  catch (e) { toast(e.message); }
+}
+async function renameFolder(id) {
+  const f = S.folders.find(x => x.id === id); const name = await dialog({title: 'Rename folder', input: f ? f.name : '', ok: 'Rename'});
+  if (!name) return;
+  try { await api('/api/explorer/folders/' + id, {method: 'PATCH', body: {name}}); await refreshSummary(); load(true); } catch (e) { toast(e.message); }
+}
+async function deleteFolder(id) {
+  const f = S.folders.find(x => x.id === id);
+  const ok = await dialog({title: 'Delete folder?', body: `<p>“${esc(f ? f.name : '')}” will be removed. Its files and subfolders move up one level. <b>Nothing is deleted from Telegram.</b></p>`, ok: 'Delete', danger: true});
+  if (!ok) return;
+  try { await api('/api/explorer/folders/' + id, {method: 'DELETE'}); if (S.view.t === 'folder' && S.view.id === id) go({t: 'folders'}); else { await refreshSummary(); load(true); } } catch (e) { toast(e.message); }
+}
+async function moveDialog(ids) {
+  const tree = (p, d) => S.folders.filter(f => (f.parent_id || null) === p).map(f => `<div class="ni" data-pick="${f.id}" style="padding-left:${10 + d * 16}px"><i class="fa-solid fa-folder ic" style="color:#f4c23d"></i><span class="t">${esc(f.name)}</span></div>` + tree(f.id, d + 1)).join('');
+  const s = document.createElement('div'); s.className = 'scrim';
+  s.innerHTML = `<div class="dlg"><h4>Move ${ids.length} reference${ids.length > 1 ? 's' : ''} to…</h4><p>Only the reference moves; the Telegram file stays where it is.</p><div style="max-height:40vh;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:4px">${tree(null, 0) || '<p style="padding:8px">No folders yet.</p>'}</div><div class="ft"><button class="btn" id="mvNew"><i class="fa-solid fa-folder-plus"></i> New folder</button><button class="btn" id="mvNo">Cancel</button></div></div>`;
+  document.body.appendChild(s);
+  s.querySelectorAll('[data-pick]').forEach(e => e.onclick = () => { s.remove(); moveFiles(ids, e.dataset.pick); });
+  $('#mvNo', s).onclick = () => s.remove(); s.onclick = e => { if (e.target === s) s.remove(); };
+  $('#mvNew', s).onclick = async () => { s.remove(); const name = await dialog({title: 'New folder', input: 'New folder', ok: 'Create & move'}); if (!name) return; try { const f = await api('/api/explorer/folders', {method: 'POST', body: {name}}); await moveFiles(ids, f.id); } catch (e) { toast(e.message); } };
+}
+async function favorite(ids, value) { try { await api('/api/explorer/favorite', {method: 'POST', body: {file_ids: ids, value}}); ids.forEach(id => { const it = byId(id); if (it) it.favorite = value; }); await refreshSummary(); if (S.view.t === 'fav') load(true); else render(); } catch (e) { toast(e.message); } }
+
+// ---------- links ----------
+async function links(it) { return api('/api/explorer/links/' + it.id); }
+async function download(it) { try { const l = await links(it); const a = document.createElement('a'); a.href = l.download; a.download = it.name; document.body.appendChild(a); a.click(); a.remove(); } catch (e) { toast(e.message); } }
+async function copyLink(it) {
+  try { const l = await links(it); await (navigator.clipboard ? navigator.clipboard.writeText(l.stream) : Promise.reject());
+    toast('Stream link copied (expires in ~' + Math.round((l.expires_at - Date.now() / 1000) / 3600) + ' h)'); }
+  catch (e) { const l = await links(it).catch(() => null); if (l) dialog({title: 'Stream link', body: `<input type="text" readonly value="${esc(l.stream)}" onclick="this.select()">`, ok: 'Close', cancel: ''}); }
+}
+async function vlcDialog(it, reason = '') {
+  let l; try { l = await links(it); } catch (e) { return toast(e.message); }
+  { const a = document.createElement('a'); a.href = l.vlc_playlist; a.download = ''; document.body.appendChild(a); a.click(); a.remove(); }  // start VLC playback immediately
+  const s = document.createElement('div'); s.className = 'scrim'; s.style.zIndex = 95;
+  s.innerHTML = `<div class="dlg"><h4><i class="fa-solid fa-circle-play" style="color:#f90"></i> Playing in VLC</h4><p style="color:var(--text);word-break:break-word"><b>${esc(it.name)}</b></p><p>A playlist file was just downloaded — open it with VLC (or click it in your browser’s download bar).</p>
+    ${reason ? `<p style="color:var(--text)">${esc(reason)}</p>` : ''}
+    <p class="mt">VLC must be installed on this PC. It plays the <b>original, untouched file</b> straight from Telegram via a temporary link that expires in about ${Math.round(LINK_H(l))} hours. No Telegram credentials are included.</p>
+    <div class="acts" style="flex-direction:column;align-items:stretch">
+      <a class="btn primary" id="vlcPl" href="${esc(l.vlc_playlist)}" style="text-decoration:none"><i class="fa-solid fa-download"></i> Download playlist again (.m3u)</a>
+      <a class="btn" id="vlcUri" href="${esc(l.vlc_uri)}" style="text-decoration:none"><i class="fa-solid fa-bolt"></i> Launch with vlc:// (one-time setup needed)</a>
+      <a class="btn" href="${esc(l.vlc_setup)}" style="text-decoration:none"><i class="fa-brands fa-windows"></i> Download one-time vlc:// setup (.reg)</a>
+      ${l.stremio ? `<a class="btn" href="${esc(l.stremio.url)}" target="_blank" style="text-decoration:none"><i class="fa-solid fa-film"></i> Open in Stremio</a>` : ''}
+      <button class="btn" id="vlcCopy"><i class="fa-solid fa-copy"></i> Copy link (VLC → Media → Open Network Stream)</button>
+    </div>
+    <p class="mt">Tip: open the downloaded .m3u once and choose “VLC media player” + “Always”, then it launches directly next time.</p>
+    <div class="ft"><button class="btn primary" id="vlcX">Close</button></div></div>`;
+  document.body.appendChild(s);
+  $('#vlcCopy', s).onclick = async () => { try { await navigator.clipboard.writeText(l.stream); toast('Link copied'); } catch (e) { prompt('Copy this link', l.stream); } };
+  $('#vlcX', s).onclick = () => s.remove(); s.onclick = e => { if (e.target === s) s.remove(); };
+}
+const LINK_H = l => Math.max(1, (l.expires_at - Date.now() / 1000) / 3600);
+
+// ---------- details pane ----------
+function renderDetails() {
+  const d = $('#details'); d.classList.toggle('open', S.detOpen); $('#detBtn').classList.toggle('active', S.detOpen);
+  if (!S.detOpen) return;
+  if (S.sel.size !== 1) { d.innerHTML = `<div class="empty" style="padding:30px 6px"><i class="fa-solid fa-circle-info"></i><div>${S.sel.size ? S.sel.size + ' items selected' : 'Select a file to see its details'}</div></div>`; return; }
+  const it = byId([...S.sel][0]); if (!it) return;
+  const fp = it.folder_id ? folderPath(it.folder_id).map(f => f.name).join(' / ') : '—';
+  d.innerHTML = `<div class="pv">${it.has_thumb ? `<img src="/explorer/thumb/${it.id}" onerror="this.replaceWith(Object.assign(document.createElement('i'),{className:'fa-solid ${iconFor(it)}'}))">` : `<i class="fa-solid ${iconFor(it)}"></i>`}</div>
+    <h3>${esc(it.name)}</h3>
+    <div class="acts"><button class="btn primary" data-a="open"><i class="fa-solid fa-play"></i> ${it.kind === 'video' || it.kind === 'audio' ? 'Play in VLC' : 'Open'}</button>
+      <button class="btn" data-a="dl"><i class="fa-solid fa-download"></i></button><button class="btn" data-a="link"><i class="fa-solid fa-link"></i></button>
+      <button class="btn" data-a="fav"><i class="fa-${it.favorite ? 'solid' : 'regular'} fa-star" style="color:#f5b301"></i></button>
+      ${it.kind === 'video' || it.kind === 'audio' ? '<button class="btn" data-a="vlc">VLC</button>' : ''}</div>
+    <div class="kv"><div>Type</div><div>${esc(KNAME[it.kind])}${it.mime ? ' · ' + esc(it.mime) : ''}</div><div>Extension</div><div>${esc(it.ext || '—')}</div><div>Size</div><div>${fmtSize(it.size)} (${(+it.size).toLocaleString()} B)</div>
+      <div>Date</div><div>${fmtDate(it.date)}</div>${it.duration ? `<div>Duration</div><div>${fmtDur(it.duration)}</div>` : ''}${it.width ? `<div>Dimensions</div><div>${it.width} × ${it.height}</div>` : ''}
+      <div>Source channel</div><div>${esc(it.channel)}</div><div>Message</div><div>#${it.msg_id}</div><div>Virtual folder</div><div>${esc(fp)}</div>${it.caption ? `<div>Caption</div><div>${esc(it.caption)}</div>` : ''}</div>`;
+  d.querySelectorAll('[data-a]').forEach(b => b.onclick = () => ({open: () => openItem(it.id), dl: () => download(it), link: () => copyLink(it), fav: () => favorite([it.id], !it.favorite), vlc: () => vlcDialog(it)})[b.dataset.a]());
+}
+$('#detBtn').onclick = () => { S.detOpen = !S.detOpen; localStorage.setItem('ex.det', S.detOpen ? '1' : '0'); renderDetails(); };
+
+// ---------- toolbar ----------
+const SORTS = [['name', 'Name'], ['date', 'Date'], ['size', 'Size'], ['type', 'File type']];
+function setSort(k) { if (S.sort === k) S.order = S.order === 'asc' ? 'desc' : 'asc'; else { S.sort = k; S.order = k === 'name' || k === 'type' ? 'asc' : 'desc'; } localStorage.setItem('ex.sort', S.sort); localStorage.setItem('ex.order', S.order); sortLabel(); load(true); }
+function sortLabel() { $('#sortLbl').textContent = (SORTS.find(s => s[0] === S.sort) || [])[1] + (S.order === 'asc' ? ' ↑' : ' ↓'); }
+$('#sortBtn').onclick = ev => { ev.stopPropagation(); const r = ev.currentTarget.getBoundingClientRect(); showMenu({clientX: r.left, clientY: r.bottom + 4}, SORTS.map(([k, l]) => ({label: l + (S.sort === k ? (S.order === 'asc' ? '  ↑' : '  ↓') : ''), icon: S.sort === k ? 'fa-check' : 'fa-minus', fn: () => setSort(k)}))); };
+function viewIcon() { $('#viewIc').className = 'fa-solid ' + (S.mode === 'grid' ? 'fa-table-cells-large' : 'fa-list'); }
+$('#viewBtn').onclick = () => { S.mode = S.mode === 'grid' ? 'list' : 'grid'; localStorage.setItem('ex.mode', S.mode); viewIcon(); render(); };
+$('#newFolder').onclick = () => newFolder(S.view.t === 'folder' ? S.view.id : null);
+$('#fKind').onchange = e => { S.kind = e.target.value; if (S.view.t === 'home' && S.kind) go({t: 'all'}); else load(true); };
+$('#fChan').onchange = e => { S.chan = e.target.value; if (S.view.t === 'home' && S.chan) go({t: 'all'}); else load(true); };
+let qt; $('#q').oninput = e => { clearTimeout(qt); qt = setTimeout(() => { S.q = e.target.value.trim(); renderCrumbs(); load(true); }, 300); };
+
+// ---------- sync ----------
+async function startSync(full) {
+  try { const r = await api('/api/explorer/sync', {method: 'POST', body: {full}}); toast(r.message); if (r.ok) pollSync(); }
+  catch (e) { toast(e.message); }
+}
+$('#syncBtn').onclick = async () => {
+  if (S.sum && S.sum.status.running) { if (await dialog({title: 'Stop indexing?', ok: 'Stop'})) { await api('/api/explorer/sync/cancel', {method: 'POST'}); } return; }
+  const r = await dialog({title: 'Sync Telegram files', body: '<p>Scans your configured channels for new files (resumes where it last stopped). New uploads are also indexed live automatically.</p><p class="mt">The bot sends and instantly deletes a tiny probe message in each channel to find its newest message ID, same as the admin Scan tool.</p>', ok: 'Sync now'});
+  if (r) startSync(false);
+};
+function updateSyncUI(st) {
+  const b = $('#syncBtn'); b.querySelector('span').textContent = st.running ? 'Stop' : 'Sync'; b.querySelector('i').className = 'fa-solid ' + (st.running ? 'fa-stop' : 'fa-arrows-rotate');
+  const el = $('#stSync');
+  if (st.running) el.innerHTML = `Indexing ${esc(st.current_name || '')} · ${st.counters.indexed} indexed <span class="bar" style="display:inline-block;vertical-align:middle"><i style="width:${st.progress}%"></i></span>`;
+  else if (st.state === 'done') el.textContent = `Last sync: ${st.counters.indexed} files indexed, ${st.counters.removed} removed`;
+  else if (st.state === 'error') el.textContent = 'Sync error: ' + st.error; else el.textContent = '';
+}
+function pollSync() {
+  if (S.syncPoll) return;
+  S.syncPoll = setInterval(async () => {
+    try { const st = await api('/api/explorer/sync/status'); S.sum.status = st; updateSyncUI(st);
+      if (!st.running) { clearInterval(S.syncPoll); S.syncPoll = null; await refreshSummary(); load(true); if (st.state === 'error') toast(st.error, 6000); }
+      else if (S.sum.total === 0 || S.view.t === 'home') { /* light refresh handled on completion */ }
+    } catch (e) {}
+  }, 2000);
+}
+
+// ---------- viewer / player ----------
+let V = null;
+function closeViewer() {
+  if (!V) return;
+  document.removeEventListener('keydown', V.key);
+  V.el.remove(); V = null;
+}
+function openItem(id) {
+  const it = byId(id); if (!it) return;
+  if (it.kind === 'video' || it.kind === 'audio') return vlcDialog(it);
+  if (it.kind === 'image') return openStatic(it, `<img src="/explorer/stream/${it.id}/${enc(it.name)}" alt="">`);
+  if (it.ext === 'pdf') return openStatic(it, `<iframe src="/explorer/stream/${it.id}/${enc(it.name)}"></iframe>`);
+  if (it.kind === 'document' || it.kind === 'subtitle' || it.kind === 'other') return openText(it);
+  download(it);
+}
+function shell(it, inner, extraTop = '') {
+  closeViewer();
+  const el = document.createElement('div'); el.className = 'viewer';
+  el.innerHTML = `<div class="vtop"><button class="btn" id="vClose"><i class="fa-solid fa-arrow-left"></i> Back</button><div class="ttl" title="${esc(it.name)}">${esc(it.name)}</div>${extraTop}
+    <button class="btn" id="vFav"><i class="fa-${it.favorite ? 'solid' : 'regular'} fa-star" style="color:#f5b301"></i></button>
+    <button class="btn" id="vDl"><i class="fa-solid fa-download"></i><span class="hm"> Download</span></button><button class="btn" id="vLink"><i class="fa-solid fa-link"></i></button></div>
+    <div class="stage" id="stage">${inner}</div><div id="vbottom"></div>`;
+  document.body.appendChild(el);
+  V = {el, it}; V.key = e => { if (e.key === 'Escape' && !document.querySelector('.scrim')) closeViewer(); };
+  document.addEventListener('keydown', V.key);
+  $('#vClose', el).onclick = closeViewer; $('#vDl', el).onclick = () => download(it); $('#vLink', el).onclick = () => copyLink(it);
+  $('#vFav', el).onclick = async () => { await favorite([it.id], !it.favorite); $('#vFav', el).innerHTML = `<i class="fa-${it.favorite ? 'solid' : 'regular'} fa-star" style="color:#f5b301"></i>`; };
+  return el;
+}
+function openStatic(it, inner) { shell(it, inner); const img = $('#stage img'); if (img) img.onerror = () => { $('#stage').innerHTML = '<div class="overlay">Could not load this file from Telegram.<button class="btn" id="dl2">Download instead</button></div>'; $('#dl2').onclick = () => download(it); }; }
+async function openText(it) {
+  shell(it, '<div class="overlay"><div class="spin"></div></div>');
+  try { const r = await api('/api/explorer/text/' + it.id); $('#stage').innerHTML = `<pre>${esc(r.text)}${r.truncated ? '\n\n… (preview truncated — download for the full file)' : ''}</pre>`; }
+  catch (e) { $('#stage').innerHTML = `<div class="overlay"><div>No inline preview for this file type.</div><button class="btn" id="dl2"><i class="fa-solid fa-download"></i> Download</button></div>`; $('#dl2').onclick = () => download(it); }
+}
+// ---------- boot ----------
+$('#content').addEventListener('contextmenu', e => { if (e.target.closest('[data-id],[data-folder]')) return; e.preventDefault(); showMenu(e, [{label: 'New folder', icon: 'fa-folder-plus', fn: () => newFolder(S.view.t === 'folder' ? S.view.id : null)}, {label: 'Refresh', icon: 'fa-rotate-right', fn: () => $('#refresh').click()}, {label: S.mode === 'grid' ? 'List view' : 'Grid view', icon: 'fa-table-cells', fn: () => $('#viewBtn').click()}]); });
+sortLabel(); viewIcon(); renderDetails();
+S.hist = [{t: 'home'}]; S.hi = 0;
+refreshSummary().then(() => { renderNav(); load(true); });
+})();
+</script>
+{% endraw %}
+</body>
+</html>

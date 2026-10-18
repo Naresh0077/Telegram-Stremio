@@ -112,6 +112,8 @@ from Backend.fastapi.routes.api_routes import (
     update_subscription_plan_api,
     update_token_limits_api,
 )
+from Backend.fastapi.routes.explorer_routes import explorer_startup
+from Backend.fastapi.routes.explorer_routes import router as explorer_router
 from Backend.fastapi.routes.stream_routes import decay_client_failures
 from Backend.fastapi.routes.stream_routes import router as stream_router
 from Backend.fastapi.routes.stremio_routes import router as stremio_router
@@ -163,11 +165,13 @@ except Exception:
 @app.on_event("startup")
 async def _startup():
     asyncio.create_task(decay_client_failures())
+    asyncio.create_task(explorer_startup())
 
 
 #----- Streaming and Stremio routers
 app.include_router(stream_router)
 app.include_router(stremio_router)
+app.include_router(explorer_router)
 
 
 #----- Public routes (no authentication)
