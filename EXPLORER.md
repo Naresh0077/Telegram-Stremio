@@ -9,24 +9,22 @@ documents, archives, subtitles, other) — with or without IMDb/TMDB metadata.
 
 No new Python packages, no ffmpeg, no second Telegram client — only new collections
 (`explorer_files`, `explorer_folders`, `explorer_state`) in your existing *tracking* DB.
+**Your streaming code is untouched** (`stream_routes.py`, `custom_dl.py`, `virtual_dl.py` are identical to the original).
+
+## Videos & audio: double-click = VLC, using the admin panel's own link
+The Explorer builds exactly what *Media → Edit → Content → Copy Link* builds:
+`https://<your-site>/dl/<API token>/<stream id>/<file name>` (first API token from the Dashboard), and hands it to VLC.
+So playback is identical to pasting that copied link into VLC — it is served by your original `/dl` streaming route.
+Nothing is downloaded; video/audio have no Download option. (No API token yet? create one on the Dashboard first.)
+
+**One-time setup per PC/browser** (a web page can't start VLC until Windows knows how): the setup box appears on the first
+double-click (or use the *VLC setup* button): download `vlc-setup.reg`, open it, click Yes, press *Done*, tick *Always allow*
+if the browser asks. Needs VLC installed (path configurable in the dialog).
 
 ## URLs
-Every view and every virtual folder has its own link, e.g. `/explorer/Movies`, `/explorer/Movies/2024`,
-`/explorer/Videos`, `/explorer/Favorites`, `/explorer/Channels/<name>`. Open them directly any time (right-click a folder →
-*Copy folder link*). Root folders can't be named like built-in views (Videos, Audio, Images, Documents, Archives, Subtitles,
-Favorites, Folders, Channels, Home, All Files, Other).
+Every view and virtual folder has its own link: `/explorer/Movies`, `/explorer/Movies/2024`, `/explorer/Videos`,
+`/explorer/Favorites`, `/explorer/Channels/<name>`. Right-click a folder → *Copy folder link*. Root folders can't be named like
+built-in views (Videos, Audio, Images, Documents, Archives, Subtitles, Favorites, Folders, Channels, Home, All Files, Other).
 
-## Videos & audio: double-click = VLC (no download)
-Double-click a video/audio file → VLC opens and plays it straight from Telegram (seeking works). Nothing is downloaded, no
-dialog or player is shown, and video/audio have no Download option anywhere.
-
-**One-time setup per PC/browser** (a web page can't start VLC until Windows knows how — unavoidable):
-click *VLC setup* (it appears automatically the first time you double-click), download `vlc-setup.reg`, open it, click Yes,
-press *Done*, and tick *Always allow* if the browser asks "Open VLC?". Needs VLC installed (path configurable in the dialog).
-The link inside is signed, expires (6 h default, `EXPLORER_LINK_TTL`) and contains no Telegram credentials.
-
-Images / PDF / text preview in the page; other file types download. Also: search, filters, favorites, drag-and-drop folders.
-
-## Streaming fix included
-`media_streamer`, `global_media_streamer` and `virtual_dl` computed one chunk too few when a Range ended exactly on a 1 MiB
-boundary (e.g. `bytes=0-0`), producing short responses. Fixed (`ceil((end+1)/chunk)`); covered by `tests/test_range_math.py`.
+Images/PDFs preview in the page (plain Telegram download, ≤ 40 MB); text files show the first 256 KB; other types use the same
+`/dl` link to download. Also: search, filters, favorites, drag-and-drop folders.

@@ -632,16 +632,17 @@ async function download(it) {                       // documents / images / arch
   try { const l = await links(it); if (!l.download) return; const a = document.createElement('a'); a.href = l.download; a.download = it.name; document.body.appendChild(a); a.click(); a.remove(); } catch (e) { toast(e.message); }
 }
 async function copyLink(it) {
-  try { const l = await links(it); await (navigator.clipboard ? navigator.clipboard.writeText(l.stream) : Promise.reject()); toast('Stream link copied'); }
-  catch (e) { const l = await links(it).catch(() => null); if (l) dialog({title: 'Stream link', body: `<input type="text" readonly value="${esc(l.stream)}" onclick="this.select()">`, ok: 'Close', cancel: ''}); }
+  try { const l = await links(it); await (navigator.clipboard ? navigator.clipboard.writeText(location.origin + l.stream_path) : Promise.reject()); toast('Stream link copied'); }
+  catch (e) { const l = await links(it).catch(() => null); if (l) dialog({title: 'Stream link', body: `<input type="text" readonly value="${esc(location.origin + l.stream_path)}" onclick="this.select()">`, ok: 'Close', cancel: ''}); }
 }
 
 // ---------- VLC: double-click opens VLC directly, nothing else is shown ----------
+const vlcUri = l => 'vlc://play/' + enc(location.origin + l.stream_path);   // same /dl link as the admin panel's Copy Link
 function launchUri(uri) { const a = document.createElement('a'); a.href = uri; a.style.display = 'none'; document.body.appendChild(a); a.click(); a.remove(); }
 async function playVlc(it) {
   let l; try { l = await links(it); } catch (e) { return toast(e.message, 4000); }
   if (!localStorage.getItem('ex.vlcReady')) return vlcSetup(l, it);     // only the very first time on this browser
-  launchUri(l.vlc_uri);
+  launchUri(vlcUri(l));
 }
 function vlcSetup(l, it) {
   const dflt = (S.sum && S.sum.default_vlc_path) || 'C:\\Program Files\\VideoLAN\\VLC\\vlc.exe';
@@ -657,7 +658,7 @@ function vlcSetup(l, it) {
   const path = $('#vlcPath', s), reg = $('#regLink', s);
   path.oninput = () => { reg.href = '/_ex/vlc-setup.reg?path=' + enc(path.value.trim()); };
   $('#vNo', s).onclick = () => s.remove(); s.onclick = e => { if (e.target === s) s.remove(); };
-  $('#vOk', s).onclick = () => { localStorage.setItem('ex.vlcReady', '1'); s.remove(); if (l) launchUri(l.vlc_uri); else toast('VLC setup saved'); };
+  $('#vOk', s).onclick = () => { localStorage.setItem('ex.vlcReady', '1'); s.remove(); if (l) launchUri(vlcUri(l)); else toast('VLC setup saved'); };
 }
 $('#vlcBtn').onclick = () => vlcSetup(null, null);
 
@@ -725,8 +726,8 @@ function pollSync() {
 function openItem(id) {
   const it = byId(id); if (!it) return;
   if (isMedia(it)) return playVlc(it);
-  if (it.kind === 'image') return openStatic(it, `<img src="/_ex/stream/${it.id}/${enc(it.name)}" alt="">`);
-  if (it.ext === 'pdf') return openStatic(it, `<iframe src="/_ex/stream/${it.id}/${enc(it.name)}"></iframe>`);
+  if (it.kind === 'image') return openStatic(it, `<img src="/_ex/preview/${it.id}/${enc(it.name)}" alt="">`);
+  if (it.ext === 'pdf') return openStatic(it, `<iframe src="/_ex/preview/${it.id}/${enc(it.name)}"></iframe>`);
   if (it.kind === 'document' || it.kind === 'subtitle' || it.kind === 'other') return openText(it);
   download(it);
 }

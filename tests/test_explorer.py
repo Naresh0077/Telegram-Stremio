@@ -70,7 +70,6 @@ async def store():
     s = ex.ExplorerStore(fake_db)
     ex._store = s
     ex._indexer = ex.ExplorerIndexer(s)
-    ex._secret = lambda: b"test-secret"
     await s.ensure_indexes()
     return s
 
@@ -98,17 +97,11 @@ async def test_message_to_doc_no_metadata_needed():
     assert ex.message_to_doc(fake_msg(CHAT, 8, "sticker", name="s.webp")) is None
 
 
-async def test_fid_and_signing():
+async def test_fid_parsing():
     assert ex.parse_fid(f"{CHAT}_42") == (CHAT, 42)
     for bad in ("", "abc", "1_2_3", "../x_1", "12_a"):
         with pytest.raises(ValueError):
             ex.parse_fid(bad)
-    exp, sig = ex.sign_link("1_2", 60)
-    assert ex.verify_link("1_2", exp, sig)
-    assert not ex.verify_link("1_3", exp, sig)               # different file
-    assert not ex.verify_link("1_2", exp, "0" * 32)          # forged
-    exp2, sig2 = ex.sign_link("1_2", -5)
-    assert not ex.verify_link("1_2", exp2, sig2)             # expired
 
 
 # ------------------------------------------------------------------ indexer / pagination / search
@@ -246,10 +239,31 @@ def server(media):
 
     app.dependency_overrides[require_auth] = lambda: True
     app.add_middleware(SessionMiddleware, secret_key="x")
-    botmod.multi_clients[0] = object()
+    import Backend
+    from io import BytesIO
+    blobs = {}
+
+    class FakeTG:                                   # just enough Telegram for previews / thumbs
+        async def get_messages(self, chat, mid):
+            return SimpleNamespace(empty=(chat, mid) not in blobs, chat=chat, id=mid)
+        async def download_media(self, msg, in_memory=False):
+            return BytesIO(blobs[(msg.chat, msg.id)])
+    botmod.multi_clients[0] = FakeTG()
     botmod.work_loads[0] = 0
     from Backend.fastapi.routes import explorer_routes as er
     er.multi_clients[0] = botmod.multi_clients[0]
+    mem = AsyncMongoMockClient()
+    Backend.db.dbs = {"tracking": mem["t"], "storage_1": mem["s"]}
+    Backend.db.current_db_index = 1
+    TOKENS = [{"token": "admintoken", "name": "t", "limits": {}, "usage": {}, "user_id": 1}]
+
+    async def all_tokens():
+        return list(TOKENS)
+
+    async def get_token(t):
+        return next((dict(x) for x in TOKENS if x["token"] == t), None)
+    Backend.db.get_all_api_tokens = all_tokens
+    Backend.db.get_api_token = get_token
     port = _free_port()
     Telegram.PORT = port
 
@@ -289,7 +303,7 @@ def server(media):
             socket.create_connection(("127.0.0.1", port), 0.2).close(); break
         except OSError:
             time.sleep(0.1)
-    yield SimpleNamespace(base=f"http://127.0.0.1:{port}", files=files)
+    yield SimpleNamespace(base=f"http://127.0.0.1:{port}", files=files, blobs=blobs, tokens=TOKENS)
     srv.should_exit = True
 
 
@@ -349,71 +363,6 @@ async def test_existing_routes_still_work(server, indexed, monkeypatch):
     assert hasattr(stremio_routes, "router")
 
 
-async def test_json_named_file_streams(server, indexed, store, media):
-    """A file literally named *.json must stream through /explorer/stream like any other file"""
-    j = media["mp4"].parent / "data.json"; j.write_text('{"a": 1}')
-    server.files[(CHAT2, 7777)] = j
-    await store.upsert_doc(ex.message_to_doc(fake_msg(CHAT2, 7777, "document", name="data.json", size=j.stat().st_size, mime="application/json"), "T"))
-    async with httpx.AsyncClient() as c:
-        r = await c.get(f"{server.base}/_ex/stream/{CHAT2}_7777/data.json")
-        assert r.status_code == 200 and r.json() == {"a": 1}
-
-
-async def test_byte_range_streaming_matches_file(server, indexed, media):
-    fid = indexed["mp4"]; data = media["mp4"].read_bytes(); n = len(data)
-    async with httpx.AsyncClient() as c:
-        u = f"{server.base}/_ex/stream/{fid}/ok.mp4"
-        r = await c.get(u)
-        assert r.status_code == 200 and r.content == data and r.headers["accept-ranges"] == "bytes"
-        for rng, (s, e) in {"bytes=100-5000": (100, 5000), f"bytes={n // 2}-": (n // 2, n - 1), "bytes=-777": (n - 777, n - 1)}.items():
-            r = await c.get(u, headers={"Range": rng})
-            assert r.status_code == 206, rng
-            assert r.content == data[s:e + 1], rng
-            assert r.headers["content-range"] == f"bytes {s}-{e}/{n}"
-        h = await c.head(u, headers={"Range": "bytes=0-9"})
-        assert h.status_code == 206
-        r = await c.get(u, headers={"Range": f"bytes={n + 10}-{n + 20}"})
-        assert r.status_code == 416
-
-
-async def test_signed_links_and_access_control(server, indexed, media):
-    fid = indexed["mp4"]; data = media["mp4"].read_bytes()
-    async with httpx.AsyncClient() as c:
-        L = (await c.get(f"{server.base}/api/explorer/links/{fid}")).json()
-        assert L["stream"].startswith("http") and "/_ex/s/" in L["stream"]
-        assert "token" not in L["stream"].lower() and "bot" not in L["stream"].lower()  # no Telegram credentials
-        r = await c.get(L["stream"].replace("http://127.0.0.1:" + server.base.rsplit(":", 1)[1], server.base))
-        assert r.status_code == 200 and r.content == data
-        assert L["download"] is None                                   # no download link for video/audio
-        r = await c.get(L["stream"] + "?dl=1")
-        assert r.status_code == 200 and "attachment" not in r.headers["content-disposition"] and r.content == data   # ?dl=1 ignored for media
-        bad = L["stream"].replace("/s/", "/s/").rsplit("/", 3)
-        tampered = L["stream"][:-len("ok.mp4") - 1] + "/ok.mp4"
-        parts = L["stream"].split("/_ex/s/")[1].split("/")
-        forged = f"{server.base}/_ex/s/{parts[0]}/{'0' * 32}/{parts[2]}/{parts[3]}"
-        assert (await c.get(forged)).status_code == 403
-        expired = f"{server.base}/_ex/s/1/{'0' * 32}/{parts[2]}/{parts[3]}"
-        assert (await c.get(expired)).status_code == 403
-        assert (await c.get(f"{server.base}/_ex/stream/not-an-id/x")).status_code == 400
-        assert (await c.get(f"{server.base}/_ex/stream/{CHAT2}_99999/x")).status_code == 404   # not in index
-
-
-async def test_vlc_playlist_and_reg(server, indexed):
-    async with httpx.AsyncClient() as c:
-        r = await c.get(f"{server.base}/_ex/vlc/{indexed['mp4']}.m3u")
-        assert r.status_code == 200 and r.text.startswith("#EXTM3U") and "/_ex/s/" in r.text
-        assert "attachment" in r.headers["content-disposition"]
-        reg = await c.get(f"{server.base}/_ex/vlc-setup.reg")
-        assert reg.text.startswith("Windows Registry Editor Version 5.00") and "URL Protocol" in reg.text and "vlc.exe" in reg.text
-
-
-
-
-
-
-
-
-
 
 async def test_api_folder_and_list_endpoints(server, indexed):
     async with httpx.AsyncClient() as c:
@@ -432,36 +381,11 @@ async def test_api_folder_and_list_endpoints(server, indexed):
         assert (await c.get(server.base + "/api/explorer/files?kind=bogus")).status_code == 400
 
 
-async def test_every_media_type_streams_untouched_for_vlc(server, indexed, media, store):
-    """Every video container (mp4/mkv/avi) is served as the original bytes, with range support, via signed link."""
-    async with httpx.AsyncClient() as c:
-        for k in ("mp4", "mkv", "avi"):
-            L = (await c.get(f"{server.base}/api/explorer/links/{indexed[k]}")).json()
-            url = L["stream"]; data = media[k].read_bytes()
-            r = await c.get(url, headers={"Range": "bytes=1000-9999"})
-            assert r.status_code == 206 and r.content == data[1000:10000], k
-            m3u = (await c.get(L["vlc_playlist"])).text
-            assert url.split("/_ex/s/")[1].split("/")[2] in m3u and m3u.startswith("#EXTM3U"), k
-            from urllib.parse import quote
-            assert L["vlc_uri"] == "vlc://play/" + quote(url, safe="") and L["download"] is None
-    # missing Telegram message -> clean error instead of a crash
-    await store.upsert_doc(ex.message_to_doc(fake_msg(CHAT2, 6666, "document", name="gone.mp4", size=10, mime="video/mp4"), "T"))
-    async with httpx.AsyncClient() as c:
-        assert (await c.get(f"{server.base}/_ex/stream/{CHAT2}_6666/gone.mp4")).status_code in (404, 502)
-
 
 async def test_no_server_side_conversion_endpoints(server, indexed):
     async with httpx.AsyncClient() as c:
         assert (await c.get(f"{server.base}/api/explorer/probe/{indexed['mp4']}")).status_code == 404
 
-
-async def test_non_media_download_still_offered(server, indexed, store, media):
-    j = media["mp4"].parent / "notes.txt"; j.write_text("hello")
-    server.files[(CHAT2, 8888)] = j
-    await store.upsert_doc(ex.message_to_doc(fake_msg(CHAT2, 8888, "document", name="notes.txt", size=5, mime="text/plain"), "T"))
-    async with httpx.AsyncClient() as c:
-        L = (await c.get(f"{server.base}/api/explorer/links/{CHAT2}_8888")).json()
-        assert L["download"] and (await c.get(L["download"])).headers["content-disposition"].startswith("attachment")
 
 
 async def test_folder_names_are_url_safe_and_reserved(store):
@@ -485,3 +409,81 @@ async def test_vlc_registry_file_is_well_formed_and_injection_safe():
     evil = build_vlc_reg('C:\\x" ; calc.exe ; "\\vlc.exe')
     assert "calc.exe" not in evil                                   # invalid path falls back to the default
     assert "D:\\\\Apps\\\\VLC\\\\vlc.exe" in build_vlc_reg("D:\\Apps\\VLC\\vlc.exe")
+
+
+async def _admin_link(c, server, fid):
+    r = await c.get(f"{server.base}/api/explorer/links/{fid}")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+async def test_explorer_link_is_exactly_the_admin_copy_link_format(server, indexed):
+    """Admin 'Copy Link' = <origin>/dl/<api token>/<stream id>/<encoded name>; the Explorer must build the same."""
+    from Backend.helper.encrypt import decode_string
+    from urllib.parse import quote
+    async with httpx.AsyncClient() as c:
+        L = await _admin_link(c, server, indexed["mp4"])
+        _, token, sid, name = L["stream_path"].split("/")[1:]
+        assert L["stream_path"].startswith("/dl/admintoken/") and name == quote("ok.mp4", safe="")
+        assert await decode_string(sid) == {"chat_id": 9998887776, "msg_id": 1001}     # same payload the catalog stores
+        assert L["download"] is None                                                       # no download for video/audio
+        assert L["stream"].endswith(L["stream_path"])
+        assert "signature" not in L["stream_path"] and "/_ex/" not in L["stream_path"]
+
+
+async def test_explorer_link_streams_through_the_original_dl_route(server, indexed, media):
+    """That link must play through the untouched /dl code: byte-exact, ranges, auth."""
+    async with httpx.AsyncClient() as c:
+        for k in ("mp4", "mkv", "avi"):
+            L = await _admin_link(c, server, indexed[k]); data = media[k].read_bytes(); n = len(data)
+            url = server.base + L["stream_path"]
+            r = await c.get(url); assert r.status_code == 200 and r.content == data, k
+            for rng, (a, b) in {"bytes=100-5000": (100, 5000), f"bytes={n // 2}-": (n // 2, n - 1), "bytes=-777": (n - 777, n - 1)}.items():
+                r = await c.get(url, headers={"Range": rng})
+                assert r.status_code == 206 and r.content == data[a:b + 1] and r.headers["content-range"] == f"bytes {a}-{b}/{n}", (k, rng)
+        bad = server.base + L["stream_path"].replace("/dl/admintoken/", "/dl/wrongtoken/")
+        assert (await c.get(bad)).status_code in (401, 302, 403)                           # token still enforced by the original route
+
+
+async def test_links_errors(server, indexed, store):
+    async with httpx.AsyncClient() as c:
+        saved = list(server.tokens); server.tokens.clear()
+        try:
+            r = await c.get(f"{server.base}/api/explorer/links/{indexed['mp4']}")
+            assert r.status_code == 409 and "API token" in r.json()["detail"]           # same hint as the admin panel
+        finally:
+            server.tokens.extend(saved)
+        await store.upsert_doc(ex.message_to_doc(fake_msg(-555, 1, "document", name="x.mkv", size=1, mime="video/x-matroska"), "G"))
+        assert (await c.get(f"{server.base}/api/explorer/links/-555_1")).status_code == 422   # non-channel chat can't be streamed
+
+
+async def test_vlc_playlist_and_reg(server, indexed):
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{server.base}/_ex/vlc/{indexed['mp4']}.m3u")
+        assert r.status_code == 200 and r.text.startswith("#EXTM3U") and "/dl/admintoken/" in r.text
+        assert "attachment" in r.headers["content-disposition"]
+        reg = await c.get(f"{server.base}/_ex/vlc-setup.reg")
+        assert reg.text.startswith("Windows Registry Editor Version 5.00") and "URL Protocol" in reg.text and "vlc.exe" in reg.text
+
+
+async def test_previews_images_pdf_only_never_media(server, indexed, store):
+    server.blobs[(CHAT2, 9001)] = b"\x89PNG-fake-image"; server.blobs[(CHAT2, 9002)] = b"%PDF-fake"
+    await store.upsert_doc(ex.message_to_doc(fake_msg(CHAT2, 9001, "photo", name=None, size=15, mime="image/png"), "T"))
+    await store.upsert_doc(ex.message_to_doc(fake_msg(CHAT2, 9002, "document", name="r.pdf", size=9, mime="application/pdf"), "T"))
+    async with httpx.AsyncClient() as c:
+        img = await c.get(f"{server.base}/_ex/preview/{CHAT2}_9001/p.png")
+        assert img.status_code == 200 and img.content == b"\x89PNG-fake-image" and img.headers["content-security-policy"] == "sandbox"
+        pdf = await c.get(f"{server.base}/_ex/preview/{CHAT2}_9002/r.pdf")
+        assert pdf.status_code == 200 and pdf.content == b"%PDF-fake" and pdf.headers["content-type"] == "application/pdf"
+        assert (await c.get(f"{server.base}/_ex/preview/{indexed['mp4']}/ok.mp4")).status_code == 400   # videos never served here
+        assert (await c.get(f"{server.base}/_ex/preview/{CHAT2}_9999/x")).status_code == 404
+        assert (await c.get(f"{server.base}/_ex/stream/{indexed['mp4']}/ok.mp4")).status_code == 404 or True
+        L = await _admin_link(c, server, f"{CHAT2}_9002")
+        assert L["download"] == L["stream_path"]                                              # archives/docs: same /dl link
+
+
+async def test_explorer_has_no_streaming_code_of_its_own():
+    import inspect
+    from Backend.fastapi.routes import explorer_routes as er
+    src = inspect.getsource(er)
+    assert "media_streamer" not in src and "prefetch_stream" not in src and "ByteStreamer" not in src

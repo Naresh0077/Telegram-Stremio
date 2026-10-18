@@ -1,5 +1,4 @@
-"""File Explorer backend: Telegram attachment index, virtual folders, favorites,
-incremental channel indexer and signed (expiring) stream links.
+"""File Explorer backend: Telegram attachment index, virtual folders, favorites and incremental channel indexer.
 
 Everything lives in the existing `tracking` MongoDB database in new collections
 (`explorer_files`, `explorer_folders`, `explorer_state`). No second Telegram client
@@ -8,8 +7,6 @@ is created - the existing StreamBot / Userbot are reused.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import mimetypes
 import os
 import re
@@ -23,7 +20,6 @@ from pyrogram.errors import ChannelPrivate, ChatAdminRequired, FloodWait
 from Backend.logger import LOGGER
 
 #----- Config (environment, all optional)
-LINK_TTL = int(os.getenv("EXPLORER_LINK_TTL", "21600"))          # signed link lifetime (s)
 SCAN_BATCH_SIZE = 200
 SCAN_MAX_EMPTY_BATCHES = 10
 SCAN_MAX_ID_CAP = 5_000_000
@@ -196,28 +192,6 @@ def public_doc(doc: dict) -> dict:
         "folder_id": doc.get("folder_id"),
         "favorite": bool(doc.get("fav")),
     }
-
-
-#----- Signed, expiring links (HMAC with the app's session secret; no Telegram credentials involved)
-def _secret() -> bytes:
-    from Backend.helper.settings_manager import SettingsManager
-    return (SettingsManager.current().session_secret or "explorer-fallback").encode()
-
-
-def sign_link(fid: str, ttl: int = LINK_TTL) -> Tuple[int, str]:
-    exp = int(time.time()) + int(ttl)
-    sig = hmac.new(_secret(), f"stream:{fid}:{exp}".encode(), hashlib.sha256).hexdigest()[:32]
-    return exp, sig
-
-
-def verify_link(fid: str, exp: int, sig: str) -> bool:
-    try:
-        if int(exp) < int(time.time()):
-            return False
-        good = hmac.new(_secret(), f"stream:{fid}:{int(exp)}".encode(), hashlib.sha256).hexdigest()[:32]
-        return hmac.compare_digest(good, str(sig))
-    except Exception:
-        return False
 
 
 #----- Index + virtual folder store

@@ -4,8 +4,9 @@
 * JSON API:   /api/explorer/*
 * Raw bytes:  /_ex/*   (kept off /explorer/ so folder names can never collide with technical endpoints)
 
-Video/audio playback happens in VLC (signed link / vlc:// protocol); the server never converts or offers a
-download for media. Streaming reuses stream_routes.media_streamer - the exact Telegram/MTProto path Stremio uses.
+Video/audio playback happens in VLC using the SAME link as the admin panel's "Copy Link" button
+(/dl/<api token>/<stream id>/<name>, served by the untouched original streaming code). The Explorer contains no
+streaming code of its own, never converts anything and offers no download for media.
 """
 from __future__ import annotations
 
@@ -20,15 +21,16 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 from Backend.config import Telegram
-from Backend.fastapi.routes.stream_routes import _content_disposition, media_streamer, select_best_client
+from Backend.fastapi.routes.stream_routes import _content_disposition, select_best_client
 from Backend.fastapi.routes.template_routes import _base_context, templates
 from Backend.fastapi.security.credentials import get_current_user, require_auth
 from Backend.helper.exceptions import FileNotFound
+from Backend.helper.encrypt import encode_string
 from Backend.helper.explorer import (
-    KINDS, LINK_TTL, configured_channels, extract_media, get_indexer, get_store, parse_fid,
-    sign_link, verify_link,
+    KINDS, configured_channels, extract_media, get_indexer, get_store, parse_fid,
 )
 from Backend.helper.settings_manager import SettingsManager
+from Backend import db
 from Backend.logger import LOGGER
 from Backend.pyrofork.bot import StreamBot, multi_clients
 
@@ -71,9 +73,17 @@ def _public_base(request: Request) -> str:
     return f"{proto}://{host}"
 
 
-def _signed_path(fid: str, name: str, ttl: int = LINK_TTL) -> tuple:
-    exp, sig = sign_link(fid, ttl)
-    return f"/_ex/s/{exp}/{sig}/{fid}/{quote(name, safe='')}", exp
+#----- Same link the admin panel's "Copy Link" button produces: /dl/<api token>/<stream id>/<file name>
+async def _dl_path(doc: dict) -> str:
+    chat = str(doc["chat_id"])
+    if not chat.startswith("-100"):
+        raise HTTPException(status_code=422, detail="This chat type can't be streamed (only channels are supported)")
+    tokens = await db.get_all_api_tokens()
+    token = tokens[0].get("token") if tokens else None
+    if not token:
+        raise HTTPException(status_code=409, detail="No API token found. Please create an API token on the Dashboard page first.")
+    stream_id = await encode_string({"chat_id": int(chat[4:]), "msg_id": int(doc["msg_id"])})
+    return f"/dl/{token}/{stream_id}/{quote(doc['name'] or 'stream', safe='')}"
 
 
 def _lru_put(cache: OrderedDict, key, value, limit: int) -> None:
@@ -83,32 +93,10 @@ def _lru_put(cache: OrderedDict, key, value, limit: int) -> None:
         cache.popitem(last=False)
 
 
-#----- Core Telegram byte-range streaming (shared by session + signed endpoints) ---------------------
-async def _serve_file(request: Request, fid: str, want_download: bool = False):
-    doc = await _doc_or_404(fid)
-    #----- video/audio are play-only: never served as an attachment
-    disposition = "attachment" if (want_download and doc.get("kind") not in MEDIA_KINDS) else "inline"
-    if not multi_clients:
-        raise HTTPException(status_code=503, detail="No Telegram client available")
-    if doc.get("attr") == "photo":
-        return await _serve_image(fid, doc, disposition)
-    try:
-        resp = await media_streamer(request=request, chat_id=doc["chat_id"], msg_id=doc["msg_id"],
-                                    token="explorer", token_data=None, stream_id_hash=None)
-    except HTTPException:
-        raise
-    except FileNotFound:
-        raise HTTPException(status_code=404, detail="The Telegram message or file no longer exists")
-    except Exception as e:
-        LOGGER.warning(f"[Explorer] stream failed for {fid}: {e}")
-        raise HTTPException(status_code=502, detail="Telegram could not provide this file right now")
-    resp.headers["Content-Disposition"] = _content_disposition(doc["name"], disposition)
-    resp.headers["Cache-Control"] = "private, max-age=300"
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    return resp
-
-
-async def _serve_image(fid: str, doc: dict, disposition: str = "inline"):
+#----- In-page previews (images / PDFs up to 40 MB) via a plain Telegram download - no streaming code involved
+async def _serve_preview(fid: str, doc: dict):
+    if doc.get("kind") in MEDIA_KINDS:
+        raise HTTPException(status_code=400, detail="Videos and audio open in VLC")
     cached = _img_cache.get(fid)
     if cached:
         data, mime = cached
@@ -119,24 +107,22 @@ async def _serve_image(fid: str, doc: dict, disposition: str = "inline"):
             if getattr(msg, "empty", False):
                 raise FileNotFound()
             if doc.get("size", 0) > _MAX_IMAGE_BYTES:
-                raise HTTPException(status_code=413, detail="Image too large to preview")
+                raise HTTPException(status_code=413, detail="Too large to preview - use Download")
             buf = await client.download_media(msg, in_memory=True)
-            data, mime = buf.getvalue(), doc.get("mime") or "image/jpeg"
+            data, mime = buf.getvalue(), doc.get("mime") or "application/octet-stream"
         except HTTPException:
             raise
         except FileNotFound:
             raise HTTPException(status_code=404, detail="The Telegram message or file no longer exists")
         except Exception as e:
-            LOGGER.warning(f"[Explorer] image fetch failed for {fid}: {e}")
-            raise HTTPException(status_code=502, detail="Telegram could not provide this image right now")
+            LOGGER.warning(f"[Explorer] preview fetch failed for {fid}: {e}")
+            raise HTTPException(status_code=502, detail="Telegram could not provide this file right now")
         _lru_put(_img_cache, fid, (data, mime), _IMG_MAX)
-    from fastapi.responses import Response as _R
-    return _R(content=data, media_type=mime, headers={
-        "Content-Disposition": _content_disposition(doc["name"], disposition),
-        "Cache-Control": "private, max-age=300",
-        "Content-Security-Policy": "sandbox",
-        "X-Content-Type-Options": "nosniff",
-    })
+    headers = {"Content-Disposition": _content_disposition(doc["name"], "inline"),
+               "Cache-Control": "private, max-age=300", "X-Content-Type-Options": "nosniff"}
+    if doc.get("kind") == "image":
+        headers["Content-Security-Policy"] = "sandbox"
+    return Response(content=data, media_type=mime, headers=headers)
 
 
 #----- Index / listing -------------------------------------------------------------------------------
@@ -234,22 +220,19 @@ async def api_favorite(payload: dict, _: bool = Depends(require_auth)):
     return {"updated": await get_store().set_favorite(fids, bool(payload.get("value", True)))}
 
 
-#----- Links: stream / VLC / Stremio -------------------------------------------------------------------------
+#----- Links: the admin panel's stream link / VLC / Stremio -------------------------------------------------------------
 @router.get("/api/explorer/links/{fid}")
 async def api_links(fid: str, request: Request, _: bool = Depends(require_auth)):
     doc = await _doc_or_404(fid)
     base = _public_base(request)
-    path, exp = _signed_path(fid, doc["name"])
-    stream = f"{base}{path}"
+    path = await _dl_path(doc)
     is_media = doc.get("kind") in MEDIA_KINDS
     out = {
-        "stream": stream,
-        #----- no download link for video/audio
-        "download": None if is_media else f"{stream}?dl=1",
-        "vlc_uri": "vlc://play/" + quote(stream, safe=""),      # percent-encoded so browsers/Windows can't mangle it
+        "stream_path": path,                       # the page prefixes location.origin, exactly like the admin "Copy Link"
+        "stream": f"{base}{path}",
+        "download": None if is_media else path,    # no download for video/audio; other files use the same /dl link
         "vlc_playlist": f"{base}/_ex/vlc/{fid}.m3u",
         "vlc_setup": f"{base}/_ex/vlc-setup.reg",
-        "expires_at": exp,
         "stremio": None,
     }
     try:
@@ -266,7 +249,7 @@ async def api_links(fid: str, request: Request, _: bool = Depends(require_auth))
 @router.get("/_ex/vlc/{fid}.m3u")
 async def vlc_playlist(fid: str, request: Request, _: bool = Depends(require_auth)):
     doc = await _doc_or_404(fid)
-    path, _exp = _signed_path(fid, doc["name"])
+    path = await _dl_path(doc)
     title = doc["name"].replace("\n", " ").replace("\r", " ")
     body = f"#EXTM3U\r\n#EXTINF:{doc.get('duration') or -1},{title}\r\n{_public_base(request)}{path}\r\n"
     return Response(content=body, media_type="audio/x-mpegurl", headers={
@@ -297,19 +280,10 @@ async def vlc_protocol_reg(path: str = DEFAULT_VLC_PATH, _: bool = Depends(requi
         "Content-Disposition": _content_disposition("vlc-setup.reg", "attachment")})
 
 
-#----- Raw bytes (range-capable) ---------------------------------------------------------------------------
-@router.get("/_ex/stream/{fid}/{name}")
-@router.head("/_ex/stream/{fid}/{name}")
-async def stream_session(request: Request, fid: str, name: str, dl: int = 0, _: bool = Depends(require_auth)):
-    return await _serve_file(request, fid, bool(dl))
-
-
-@router.get("/_ex/s/{exp}/{sig}/{fid}/{name}")
-@router.head("/_ex/s/{exp}/{sig}/{fid}/{name}")
-async def stream_signed(request: Request, exp: int, sig: str, fid: str, name: str, dl: int = 0):
-    if not verify_link(fid, exp, sig):
-        raise HTTPException(status_code=403, detail="Link expired or invalid")
-    return await _serve_file(request, fid, bool(dl))
+#----- In-page preview (images / PDF) --------------------------------------------------------------------------------
+@router.get("/_ex/preview/{fid}/{name}")
+async def preview(fid: str, name: str, _: bool = Depends(require_auth)):
+    return await _serve_preview(fid, await _doc_or_404(fid))
 
 
 #----- Thumbnails + previews -----------------------------------------------------------------------------------------
