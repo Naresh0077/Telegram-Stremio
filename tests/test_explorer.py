@@ -582,24 +582,6 @@ async def test_mkv_without_telegram_thumbnail_gets_a_generated_frame(server, ind
             assert again.status_code == 200 and again.content == r.content                      # instant, no regeneration
 
 
-async def test_generated_frame_is_not_black(server, indexed, store, tmp_path):
-    """Videos that open with black frames: the generator moves on to a later point."""
-    if not shutil.which("ffmpeg") or not TH.AVAILABLE:
-        pytest.skip("needs ffmpeg + PyAV")
-    out = tmp_path / "blackstart.mkv"
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=640x360:r=25:d=40", "-f", "lavfi", "-i",
-                    "testsrc2=size=640x360:rate=25:duration=60", "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0", "-c:v", "libx264", "-preset", "ultrafast",
-                    "-pix_fmt", "yuv420p", "-g", "25", str(out)], check=True, timeout=120)
-    fid = await _add_video(server, store, 9210, out, "blackstart.mkv")
-    async with httpx.AsyncClient(timeout=60) as c:
-        r = await _poll_thumb(c, server, fid)
-    assert r.status_code == 200
-    import av, io
-    with av.open(io.BytesIO(r.content)) as ct:
-        frame = next(ct.decode(video=0))
-    lum = sum(bytes(frame.planes[0])[::13]) / len(bytes(frame.planes[0])[::13])
-    assert lum > 40, lum                                                                       # a real picture, not the black intro
-
 
 async def test_telegram_thumbnail_wins_and_no_generation_is_started(server, indexed, store):
     server.thumbs[(CHAT2, 9220)] = b"\xff\xd8TG-THUMB"
@@ -641,3 +623,44 @@ async def test_catalog_poster_is_the_last_resort(server, indexed, store, monkeyp
     async with httpx.AsyncClient(timeout=60) as c:
         r = await _poll_thumb(c, server, f"{CHAT2}_9250")                                        # generation fails (no real video) -> poster
         assert r.status_code == 302 and r.headers["location"] == "https://image.tmdb.org/t/p/w500/zzz.jpg"
+
+
+async def test_thumbnail_is_simply_the_first_frame_no_seeking(real_videos):
+    """The thumbnail is the first frame of the video: no seeking around the file, so it is fast and reads only the start."""
+    if not TH.AVAILABLE:
+        pytest.skip("PyAV not installed")
+    import av
+    real_open = av.open
+
+    class NoSeek:                                   # fails the test if the generator ever seeks
+        def __init__(self, c): self._c = c
+        def __enter__(self): self._c.__enter__(); return self
+        def __exit__(self, *a): return self._c.__exit__(*a)
+        def __getattr__(self, n):
+            if n == "seek":
+                raise AssertionError("grab_frame must not seek")
+            return getattr(self._c, n)
+    av.open = lambda *a, **k: NoSeek(real_open(*a, **k))
+    try:
+        t0 = time.time()
+        data = TH.grab_frame(str(real_videos["mkv"]))
+    finally:
+        av.open = real_open
+    assert data and data[:2] == b"\xff\xd8" and time.time() - t0 < 10
+    w, h = _jpeg_size(data)
+    assert w <= 480 and w > 0
+
+
+async def test_diagnose_link_explains_failures(server, indexed, store, real_videos, tmp_path):
+    if not TH.AVAILABLE:
+        pytest.skip("PyAV not installed")
+    good = await _add_video(server, store, 9260, real_videos["mkv"], "good.mkv")
+    junk = tmp_path / "broken.mkv"; junk.write_bytes(os.urandom(150_000))
+    bad = await _add_video(server, store, 9261, junk, "broken.mkv")
+    async with httpx.AsyncClient(timeout=90) as c:
+        r = (await c.get(f"{server.base}/api/explorer/thumb-debug/{good}")).json()
+        assert r["generation"]["ok"] is True and r["generation"]["jpeg_bytes"] > 1000 and r["telegram_thumbnail"] is False
+        assert "admintoken" not in str(r)                                                  # the token is never echoed
+        r = (await c.get(f"{server.base}/api/explorer/thumb-debug/{bad}")).json()
+        assert r["generation"]["ok"] is False and r["generation"]["error"]                  # says WHY (e.g. invalid data)
+        assert (await c.get(f"{server.base}/api/explorer/thumb-debug/{CHAT2}_424242")).status_code == 404

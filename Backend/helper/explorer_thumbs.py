@@ -1,7 +1,7 @@
 """Thumbnails for videos that Telegram has no thumbnail for (typically MKV files sent as documents).
 
-A single frame is decoded straight from the video through the app's own /dl link (HTTP range requests, so only a few MB are
-read, never the whole file) and saved as a small JPEG in a disk cache. Uses PyAV, whose wheel bundles FFmpeg's libraries:
+The FIRST frame of the video is decoded straight from the video through the app's own /dl link: no seeking, only the first
+few MB of the file are read, never the whole file. It is saved as a small JPEG in a disk cache. Uses PyAV, whose wheel bundles FFmpeg's libraries:
 nothing has to be installed on the host. If the `av` package is missing everything here quietly switches itself off.
 """
 from __future__ import annotations
@@ -26,13 +26,14 @@ ENABLED = AVAILABLE and os.getenv("EXPLORER_THUMBS", "true").lower() == "true"
 THUMB_WIDTH = 480
 CACHE_DIR = os.getenv("EXPLORER_THUMB_DIR") or os.path.join(tempfile.gettempdir(), "explorer_thumbs")
 CACHE_MAX_BYTES = int(os.getenv("EXPLORER_THUMB_CACHE_MB", "300")) * 1024 * 1024
-JOBS = max(1, int(os.getenv("EXPLORER_THUMB_JOBS", "1")))
-JOB_TIMEOUT = 120
-FAIL_TTL = 6 * 3600
+JOBS = max(1, int(os.getenv("EXPLORER_THUMB_JOBS", "3")))
+JOB_TIMEOUT = 90
+FAIL_TTL = 600                                   # a failed video is retried after 10 minutes
 
 _sem: Optional[asyncio.Semaphore] = None
 _pending: set = set()
 _failed: Dict[str, float] = {}
+errors: Dict[str, str] = {}                      # last failure reason per file (shown by the diagnose link)
 _writes = 0
 
 
@@ -104,43 +105,41 @@ def _luma(frame) -> float:
 
 
 def grab_frame(url: str, hint_seconds: float = 0.0, width: int = THUMB_WIDTH) -> Optional[bytes]:
-    """Blocking: returns JPEG bytes of a representative frame, or None. Run it in a worker thread."""
+    """Blocking: JPEG bytes of the first frame of the video (or None). Run it in a worker thread.
+    No seeking: it just decodes from the start of the file. If the very first frame is black (fade-in) it looks at the next
+    ~3 seconds of the opening for a real picture, and uses the first frame if there is none."""
     if av is None:
         return None
-    options = {"reconnect": "1", "reconnect_streamed": "1", "reconnect_delay_max": "4", "probesize": "8000000", "analyzeduration": "8000000"}
-    with av.open(url, mode="r", timeout=(10.0, 30.0), options=options) as c:
+    options = {"reconnect": "1", "reconnect_streamed": "1", "reconnect_delay_max": "4", "probesize": "3000000", "analyzeduration": "3000000"}
+    with av.open(url, mode="r", timeout=(25.0, 60.0), options=options) as c:
         vs = next((s for s in c.streams if s.type == "video"), None)
         if vs is None:
             return None
-        dur = (c.duration / av.time_base) if c.duration else float(hint_seconds or 0)
-        if dur and dur > 40:
-            targets = [dur * 0.10, dur * 0.25, dur * 0.45]
-        elif dur and dur > 4:
-            targets = [dur * 0.3, dur * 0.6]
-        else:
-            targets = [min(5.0, dur * 0.5) if dur else 0.0, 0.0]
-        best = None
-        for t in targets:
-            try:
-                c.seek(int(max(0.0, t) * av.time_base), backward=True, any_frame=False)
-            except Exception:
-                try:
-                    c.seek(0)
-                except Exception:
-                    pass
-            frame = None
-            try:
-                for frame in c.decode(vs):
-                    break
-            except Exception:
-                frame = None
-            if frame is None:
-                continue
-            best = frame
-            lum = _luma(frame)
-            if 20 < lum < 235:                       # skip black / blown-out frames (fade-ins, studio logos)
+        first = None
+        for n, frame in enumerate(c.decode(vs)):
+            if first is None:
+                first = frame
+            if 20 < _luma(frame) < 235 or n >= 75:
+                first = frame if 20 < _luma(frame) < 235 else first
                 break
-        return _encode_jpeg(best, width) if best is not None else None
+        return _encode_jpeg(first, width) if first is not None else None
+
+
+def diagnose(url: str) -> dict:
+    """Blocking: try to make a thumbnail and report exactly what happened (for the 'Diagnose' link)."""
+    out = {"av_installed": AVAILABLE, "av_version": getattr(av, "__version__", None), "enabled": ENABLED}
+    if not AVAILABLE:
+        out["error"] = "The 'av' package is not installed (restart the app so it installs; see EXPLORER.md)"
+        return out
+    t = time.time()
+    try:
+        data = grab_frame(url)
+        out.update(ok=bool(data), jpeg_bytes=len(data or b""), seconds=round(time.time() - t, 2))
+        if not data:
+            out["error"] = "The file has no video stream that could be decoded"
+    except Exception as e:
+        out.update(ok=False, seconds=round(time.time() - t, 2), error=f"{type(e).__name__}: {e}")
+    return out
 
 
 # ----------------------------------------------------------------------------------------------- async queue
@@ -174,10 +173,13 @@ def request(fid: str, url: str, hint_seconds: float = 0.0) -> str:
                 data = await asyncio.wait_for(loop.run_in_executor(None, grab_frame, url, hint_seconds), JOB_TIMEOUT)
             if data:
                 store(fid, data)
+                errors.pop(fid, None)
             else:
+                errors[fid] = "no decodable video stream"
                 _failed[fid] = time.time() + FAIL_TTL
         except Exception as e:
-            LOGGER.info(f"[Explorer] thumbnail generation failed for {fid}: {e}")
+            errors[fid] = f"{type(e).__name__}: {e}"
+            LOGGER.warning(f"[Explorer] thumbnail generation failed for {fid}: {errors[fid]}")
             _failed[fid] = time.time() + FAIL_TTL
         finally:
             _pending.discard(fid)

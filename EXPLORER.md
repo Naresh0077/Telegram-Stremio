@@ -38,17 +38,17 @@ built-in views (Videos, Audio, Images, Documents, Archives, Subtitles, Favorites
 
 ## Thumbnails (also for MKV)
 Order: (1) the picture Telegram stored on the file (MP4s usually have one); (2) for videos without one, which is typical for MKV
-sent as a document, a **frame decoded from the video itself**, made in the background with PyAV (package `av`, whose wheel
-bundles FFmpeg's libraries, so **nothing is installed on the server**, you only rebuild so the new Python package gets
-installed); (3) the poster of the matching Stremio catalog entry; (4) a file-type icon.
-The frame is taken ~10 % into the video (black frames are skipped), works for H.264 / HEVC / 10-bit / AV1 / AVI, is scaled to
-480 px and cached on disk (`EXPLORER_THUMB_DIR`, default a temp folder, capped at `EXPLORER_THUMB_CACHE_MB`=300). Videos are
-processed one at a time (`EXPLORER_THUMB_JOBS`), each read goes through your normal `/dl` link and fetches only a few MB.
-Tiles show an icon first and the picture appears as soon as it is ready. `EXPLORER_THUMBS=false` switches generation off.
-If `av` is not installed the Explorer still works and shows a one-line tip.
+sent as a document, the **first frame of the video itself** (no seeking, only the first few MB of the file are read), made in
+the background with PyAV (package `av`, its wheel bundles FFmpeg's libraries, so nothing is installed on the server: the app
+installs the package by itself on the next Restart); (3) the poster of the matching Stremio catalog entry; (4) a file-type icon.
+If the very first frame is black (a fade-in) the next ~3 seconds of the opening are checked for a real picture.
+Works for H.264 / HEVC / 10-bit / AV1 / AVI. Scaled to 480 px, cached on disk (`EXPLORER_THUMB_DIR`, capped at
+`EXPLORER_THUMB_CACHE_MB`=300), 3 videos at a time (`EXPLORER_THUMB_JOBS`). Tiles show an icon first and the picture appears
+when it is ready. `EXPLORER_THUMBS=false` switches generation off; a failed video is retried after 10 minutes.
+**A video still shows no picture?** Select it → Properties → *Diagnose*: it tries right now and prints the exact reason.
 
 ## Image viewer
-Double-click / tap an image: ◀ ▶ buttons or ← → keys (Home / End), swipe on a phone, a "3 / 24" counter, a filmstrip, the
+Double-click / tap an image (it is fitted completely inside the window): ◀ ▶ buttons or ← → keys (Home / End), swipe on a phone, a "3 / 24" counter, a filmstrip, the
 next pictures are preloaded, and more pages load automatically when you reach the end of the list. Esc, ✕ or the browser/phone
 Back button closes it and leaves you in the same folder.
 

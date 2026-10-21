@@ -116,11 +116,11 @@ td{padding:2px 8px 2px 0;vertical-align:top}
 .vtop{display:flex;align-items:center;gap:6px;padding-left:10px;background:#2b2b2b;color:#fff}
 .vtop .ttl{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .vtop .btn{min-width:0;color:#fff;background:#3a3a3a;border-color:#666}
-.stage{flex:1;min-height:0;position:relative;display:grid;place-items:center}
-.stage img{max-width:100%;max-height:100%;object-fit:contain}
-.stage iframe{width:100%;height:100%;border:0;background:#fff}
-.stage pre{margin:0;padding:14px;overflow:auto;width:100%;height:100%;font:12px/1.5 Consolas,monospace;white-space:pre-wrap;word-break:break-word;color:#e8e8e8}
-.stage .msg{color:#ccc;text-align:center;display:flex;flex-direction:column;gap:10px;align-items:center}
+.stage{flex:1;min-height:0;position:relative;overflow:hidden}
+.stage img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+.stage iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#fff}
+.stage pre{position:absolute;inset:0;margin:0;padding:14px;overflow:auto;font:12px/1.5 Consolas,monospace;white-space:pre-wrap;word-break:break-word;color:#e8e8e8}
+.stage .msg{position:absolute;inset:0;color:#ccc;text-align:center;display:flex;flex-direction:column;gap:10px;align-items:center;justify-content:center}
 @media (max-width:1280px){.tiles{grid-template-columns:repeat(5,minmax(0,1fr))}}
 @media (max-width:1100px){.tiles{grid-template-columns:repeat(4,minmax(0,1fr))}}
 @media (max-width:860px){
@@ -146,7 +146,8 @@ td{padding:2px 8px 2px 0;vertical-align:top}
 .mn{font-size:14px;line-height:1.25;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
 .mm{color:var(--muted);font-size:12px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .mck{width:22px;height:22px;border:2px solid var(--muted);display:grid;place-items:center;flex:none}
-.mrow.sel .mck{background:var(--blue);border-color:var(--blue);color:#fff}
+.mck svg{visibility:hidden}
+.mrow.sel .mck{background:var(--blue);border-color:var(--blue);color:#fff}.mrow.sel .mck svg{visibility:visible}
 .sh{place-items:end stretch!important;padding:0!important}
 .shbg{position:absolute;inset:0}
 .sheet{position:relative;width:100%;max-height:82vh;overflow:auto;background:var(--rib);border-top:1px solid #4a86bd;padding-bottom:env(safe-area-inset-bottom,0px)}
@@ -181,13 +182,13 @@ html.m .vtop{padding-left:4px}html.m .vtop .btn,html.m .wc{min-height:44px}
 /* ===== image gallery ===== */
 .gal .vtop{background:rgba(32,32,32,.94)}
 .gcount{color:#bbb;font-size:12px;min-width:64px;font-variant-numeric:tabular-nums}
-.gal .stage{background:#101010;overflow:hidden}
-.gal #gImg{max-width:100%;max-height:100%;object-fit:contain;transition:opacity .12s}
+.gal .stage{background:#101010}
+.gal #gImg{transition:opacity .12s}
 .gal #gImg.loading{opacity:.3}
 .gnav{position:absolute;top:50%;transform:translateY(-50%);width:54px;height:100px;display:grid;place-items:center;background:rgba(0,0,0,.4);color:#fff;border:0;z-index:2;opacity:0;transition:opacity .15s;cursor:pointer}
 .gal .stage:hover .gnav{opacity:1}.gnav:hover{background:rgba(0,0,0,.7)}.gnav:disabled{display:none}
 .gnav.gl{left:0}.gnav.gr{right:0}
-.gspin{position:absolute;width:34px;height:34px;border:3px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:sp 1s linear infinite;display:none}.gspin.on{display:block}
+.gspin{position:absolute;left:50%;top:50%;margin:-17px 0 0 -17px;width:34px;height:34px;border:3px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:sp 1s linear infinite;display:none}.gspin.on{display:block}
 @keyframes sp{to{transform:rotate(360deg)}}
 .gstrip{height:76px;background:#1b1b1b;display:flex;gap:4px;overflow-x:auto;padding:7px 8px;flex:none;border-top:1px solid #333;scrollbar-width:thin}
 .gth{flex:none;width:98px;height:62px;border:2px solid transparent;background:#000;opacity:.6;position:relative;cursor:pointer}
@@ -518,7 +519,7 @@ const metaOf = r => r.f ? `${r.count} item${r.count === 1 ? '' : 's'}` : [fmtBig
 const mrowHtml = r => {
   const on = S.sel.has(r.k);
   const th = r.f ? `<div class="mth">${FOLDER_IC(34)}</div>` : `<div class="mth">${iconOf(r, 28)}${thumbImg(r)}</div>`;
-  return `<div class="mrow it${on ? ' sel' : ''}" data-a="sel" data-v="${r.k}" ${r.f ? `data-fk="${r.id}"` : `data-id="${r.id}"`}>${th}<div class="mtx"><div class="mn">${S.ren === r.k ? `<input id="ri" class="ri" value="${esc(r.name)}">` : esc(r.f ? r.name : dn(r))}${!r.f && r.favorite ? ' ' + ic('star', 11, '#F5B301', '#F5B301', 1) : ''}</div><div class="mm">${esc(metaOf(r))}</div></div>${S.selMode ? `<span class="mck">${on ? ic('check', 14, 'currentColor', 'none', 2.6) : ''}</span>` : ''}</div>`;
+  return `<div class="mrow it${on ? ' sel' : ''}" data-a="sel" data-v="${r.k}" ${r.f ? `data-fk="${r.id}"` : `data-id="${r.id}"`}>${th}<div class="mtx"><div class="mn">${S.ren === r.k ? `<input id="ri" class="ri" value="${esc(r.name)}">` : esc(r.f ? r.name : dn(r))}${!r.f && r.favorite ? ' ' + ic('star', 11, '#F5B301', '#F5B301', 1) : ''}</div><div class="mm">${esc(metaOf(r))}</div></div>${S.selMode ? `<span class="mck">${ic('check', 14, 'currentColor', 'none', 2.6)}</span>` : ''}</div>`;
 };
 function homeHtml() {
   const sum = S.sum;
@@ -717,7 +718,7 @@ function props() {
   dlg('Properties', `<div class="fx ac" style="gap:10px;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--line)">${iconOf(one, 36)}<b style="word-break:break-all">${esc(one.name)}</b></div><table>
     <tr><td>Type:</td><td>${esc(typeOf(one))} (${esc(one.mime || '')})</td></tr><tr><td>Size:</td><td>${fmtBig(one.size)} (${(+one.size).toLocaleString()} bytes)</td></tr><tr><td>Modified:</td><td>${fmtD(one.date)}</td></tr>
     ${one.duration ? `<tr><td>Length:</td><td>${fmtDur(one.duration)}</td></tr>` : ''}${one.width ? `<tr><td>Dimensions:</td><td>${one.width} × ${one.height}</td></tr>` : ''}
-    <tr><td>Source channel:</td><td>${esc(one.channel)}</td></tr><tr><td>Message:</td><td>#${one.msg_id}</td></tr><tr><td>Folder:</td><td>${esc(one.folder_id ? folderPath(one.folder_id).map(f => f.name).join(' › ') : '—')}</td></tr></table>`);
+    <tr><td>Source channel:</td><td>${esc(one.channel)}</td></tr><tr><td>Message:</td><td>#${one.msg_id}</td></tr><tr><td>Folder:</td><td>${esc(one.folder_id ? folderPath(one.folder_id).map(f => f.name).join(' › ') : '—')}</td></tr>${one.kind === 'video' ? `<tr><td>Thumbnail:</td><td><a href="/api/explorer/thumb-debug/${one.id}" target="_blank" style="color:#3FA0F0">Diagnose</a></td></tr>` : ''}</table>`);
 }
 const saveOpen = () => LS.set('ex.open', JSON.stringify([...S.open]));
 function setSort(k) { if (S.sort === k) S.order = S.order === 'asc' ? 'desc' : 'asc'; else { S.sort = k; S.order = (k === 'date' || k === 'size') ? 'desc' : 'asc'; } LS.set('ex.sort', S.sort); LS.set('ex.order', S.order); load(true); }
@@ -732,6 +733,11 @@ function pollSync() {
   }, 2000);
 }
 
+function paintSel() {
+  document.querySelectorAll('#main [data-a="sel"]').forEach(el => el.classList.toggle('sel', S.sel.has(el.dataset.v)));
+  if (isM()) { if (!S.selMode && document.querySelector('#main .mck')) render(); else mbar(); }
+  else { ribbon(); details(); status(); }
+}
 const ACT = {
   tab: v => { S.tab = v; }, go: v => go(JSON.parse(v)),
   tg: v => { S.open.has(v) ? S.open.delete(v) : S.open.add(v); saveOpen(); },
@@ -793,6 +799,7 @@ document.addEventListener('click', e => {
   if (a !== 'rec') S.menu = 0;
   if (S.ren) { const i = $('#ri'); if (i && !(a === 'sel' && el.dataset.v === S.ren)) { commitRename(i.value); return; } }
   if (ACT[a]?.(el.dataset.v, e, el) === 'done') return;
+  if (a === 'sel' || a === 'clr') { paintSel(); return; }       // only change the highlight; the tiles themselves stay, so double-click works
   render();
 });
 document.addEventListener('dblclick', e => {

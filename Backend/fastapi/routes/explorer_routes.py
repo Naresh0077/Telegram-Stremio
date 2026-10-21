@@ -366,6 +366,25 @@ async def thumb(fid: str, _: bool = Depends(require_auth)):
     raise HTTPException(status_code=404, detail="No thumbnail")
 
 
+@router.get("/api/explorer/thumb-debug/{fid}")
+async def thumb_debug(fid: str, _: bool = Depends(require_auth)):
+    """Open this in the browser for a video that shows no thumbnail: it tries right now and says exactly why it fails."""
+    doc = await _doc_or_404(fid)
+    info = {"file": doc["name"], "kind": doc.get("kind"), "telegram_thumbnail": None, "last_error": TH.errors.get(fid), "state": TH.state(fid)}
+    try:
+        info["telegram_thumbnail"] = bool(await _telegram_thumb(doc))
+    except Exception as e:
+        info["telegram_thumbnail"] = f"check failed: {type(e).__name__}: {e}"
+    try:
+        url = f"http://127.0.0.1:{Telegram.PORT}{await _dl_path(doc)}"
+    except HTTPException as e:
+        info["error"] = f"cannot build the stream link: {e.detail}"
+        return info
+    info["stream_url"] = url.split("/dl/")[0] + "/dl/<token>/..."
+    info["generation"] = await asyncio.get_running_loop().run_in_executor(None, TH.diagnose, url)
+    return info
+
+
 @router.get("/api/explorer/text/{fid}")
 async def text_preview(fid: str, _: bool = Depends(require_auth)):
     doc = await _doc_or_404(fid)
