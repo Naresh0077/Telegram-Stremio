@@ -36,8 +36,21 @@ Every view and virtual folder has its own link: `/explorer/Movies`, `/explorer/M
 `/explorer/Favorites`, `/explorer/Channels/<name>`. Right-click a folder → *Copy folder link*. Root folders can't be named like
 built-in views (Videos, Audio, Images, Documents, Archives, Subtitles, Favorites, Folders, Channels, Home, All Files, Other).
 
-Thumbnails: the picture Telegram stored on the file; if there is none, the poster of the matching Stremio catalog entry;
-otherwise a file-type icon. (Files sent to Telegram as plain documents usually have no Telegram thumbnail.)
+## Thumbnails (also for MKV)
+Order: (1) the picture Telegram stored on the file (MP4s usually have one); (2) for videos without one, which is typical for MKV
+sent as a document, a **frame decoded from the video itself**, made in the background with PyAV (package `av`, whose wheel
+bundles FFmpeg's libraries, so **nothing is installed on the server**, you only rebuild so the new Python package gets
+installed); (3) the poster of the matching Stremio catalog entry; (4) a file-type icon.
+The frame is taken ~10 % into the video (black frames are skipped), works for H.264 / HEVC / 10-bit / AV1 / AVI, is scaled to
+480 px and cached on disk (`EXPLORER_THUMB_DIR`, default a temp folder, capped at `EXPLORER_THUMB_CACHE_MB`=300). Videos are
+processed one at a time (`EXPLORER_THUMB_JOBS`), each read goes through your normal `/dl` link and fetches only a few MB.
+Tiles show an icon first and the picture appears as soon as it is ready. `EXPLORER_THUMBS=false` switches generation off.
+If `av` is not installed the Explorer still works and shows a one-line tip.
 
-Images/PDFs preview in the page (plain Telegram download, ≤ 40 MB); text files show the first 256 KB; other types use the same
+## Image viewer
+Double-click / tap an image: ◀ ▶ buttons or ← → keys (Home / End), swipe on a phone, a "3 / 24" counter, a filmstrip, the
+next pictures are preloaded, and more pages load automatically when you reach the end of the list. Esc, ✕ or the browser/phone
+Back button closes it and leaves you in the same folder.
+
+PDFs preview in the page (plain Telegram download, ≤ 40 MB); text files show the first 256 KB; other types use the same
 `/dl` link to download. Also: search, filters, favorites, drag-and-drop folders.
