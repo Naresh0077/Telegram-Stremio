@@ -19,13 +19,14 @@ from typing import List, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from Backend.config import Telegram
 from Backend.fastapi.routes.stream_routes import _content_disposition, select_best_client
 from Backend.fastapi.routes.template_routes import _base_context, templates
 from Backend.fastapi.security.credentials import get_current_user, require_auth
 from Backend.helper.exceptions import FileNotFound
+from Backend.helper import explorer_thumbs as TH
 from Backend.helper.encrypt import encode_string
 from Backend.helper.explorer import (
     KINDS, configured_channels, extract_media, get_indexer, get_store, parse_fid,
@@ -135,6 +136,8 @@ async def api_summary(_: bool = Depends(require_auth)):
     data["status"] = get_indexer().get_status()
     data["configured_channels"] = configured_channels()
     data["default_vlc_path"] = DEFAULT_VLC_PATH
+    data["thumb_generation"] = TH.ENABLED
+    data["thumb_installed"] = TH.AVAILABLE
     return data
 
 
@@ -288,8 +291,8 @@ async def preview(fid: str, name: str, _: bool = Depends(require_auth)):
 
 
 #----- Thumbnails + previews -----------------------------------------------------------------------------------------
-_thumb_miss: dict = {}                       # fid -> expiry: files that have neither a Telegram thumbnail nor a poster
-_THUMB_MISS_TTL = 600
+_no_tg: dict = {}                            # fid -> expiry: Telegram has no thumbnail stored on this message
+_NO_TG_TTL = 6 * 3600
 _thumb_sem = asyncio.Semaphore(4)            # never hammer Telegram with a screenful of thumbnail requests at once
 
 
@@ -311,37 +314,56 @@ async def _telegram_thumb(doc: dict) -> Optional[bytes]:
     return None
 
 
+def _jpeg(data: bytes):
+    return Response(content=data, media_type="image/jpeg", headers={
+        "Cache-Control": "private, max-age=86400", "Content-Security-Policy": "sandbox"})
+
+
 @router.get("/_ex/thumb/{fid}")
 async def thumb(fid: str, _: bool = Depends(require_auth)):
+    """200 = JPEG, 202 = being generated (ask again in a few seconds), 302 = catalog poster, 404 = nothing available."""
     doc = await _doc_or_404(fid)
-    data = _thumb_cache.get(fid)
-    if data is None:
-        if _thumb_miss.get(fid, 0) > time.time():
-            raise HTTPException(status_code=404, detail="No thumbnail")
-        #----- 1) the thumbnail Telegram has for this file (don't trust the indexed has_thumb flag: it can be stale)
+    data = _thumb_cache.get(fid) or TH.cached(fid)
+    if data:
+        _lru_put(_thumb_cache, fid, data, _THUMB_MAX)
+        return _jpeg(data)
+    #----- 1) the thumbnail Telegram has for this file
+    if _no_tg.get(fid, 0) <= time.time():
         try:
             data = await _telegram_thumb(doc)
         except Exception as e:
             LOGGER.warning(f"[Explorer] thumbnail fetch failed for {fid}: {e}")
             data = None
         if data:
+            TH.store(fid, data)
             _lru_put(_thumb_cache, fid, data, _THUMB_MAX)
-        else:
-            #----- 2) fall back to the poster of the matching catalog entry (movies/series known to Stremio)
-            poster = ""
-            try:
-                entry = await get_store().catalog_entry(doc["chat_id"], doc["msg_id"])
-                poster = (entry or {}).get("poster") or ""
-            except Exception as e:
-                LOGGER.debug(f"[Explorer] poster lookup failed for {fid}: {e}")
-            if poster.startswith(("http://", "https://")):
-                return RedirectResponse(poster, status_code=302, headers={"Cache-Control": "private, max-age=86400"})
-            _thumb_miss[fid] = time.time() + _THUMB_MISS_TTL
-            if len(_thumb_miss) > 5000:
-                _thumb_miss.clear()
-            raise HTTPException(status_code=404, detail="No thumbnail")
-    return Response(content=data, media_type="image/jpeg", headers={
-        "Cache-Control": "private, max-age=86400", "Content-Security-Policy": "sandbox"})
+            return _jpeg(data)
+        _no_tg[fid] = time.time() + _NO_TG_TTL
+        if len(_no_tg) > 20000:
+            _no_tg.clear()
+    #----- 2) a frame decoded from the video itself (MKV etc. sent as documents have no Telegram thumbnail)
+    if doc.get("kind") == "video" and TH.ENABLED:
+        try:
+            url = f"http://127.0.0.1:{Telegram.PORT}{await _dl_path(doc)}"
+            state = TH.request(fid, url, doc.get("duration") or 0)
+        except HTTPException:
+            state = "failed"
+        if state == "pending":
+            return JSONResponse({"status": "pending"}, status_code=202, headers={"Retry-After": "3", "Cache-Control": "no-store"})
+        if state == "ready":
+            data = TH.cached(fid)
+            if data:
+                return _jpeg(data)
+    #----- 3) fall back to the poster of the matching catalog entry (movies/series known to Stremio)
+    poster = ""
+    try:
+        entry = await get_store().catalog_entry(doc["chat_id"], doc["msg_id"])
+        poster = (entry or {}).get("poster") or ""
+    except Exception as e:
+        LOGGER.debug(f"[Explorer] poster lookup failed for {fid}: {e}")
+    if poster.startswith(("http://", "https://")):
+        return RedirectResponse(poster, status_code=302, headers={"Cache-Control": "private, max-age=86400"})
+    raise HTTPException(status_code=404, detail="No thumbnail")
 
 
 @router.get("/api/explorer/text/{fid}")

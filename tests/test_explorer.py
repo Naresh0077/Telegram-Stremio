@@ -23,6 +23,8 @@ os.environ.setdefault("API_ID", "1")
 os.environ.setdefault("API_HASH", "x")
 os.environ.setdefault("BOT_TOKEN", "1:x")
 os.environ.setdefault("DATABASE", "mongodb://a,mongodb://b")
+import tempfile as _tf
+os.environ.setdefault("EXPLORER_THUMB_DIR", _tf.mkdtemp(prefix="ex_thumbs_"))
 
 from mongomock_motor import AsyncMongoMockClient  # noqa: E402
 
@@ -514,23 +516,128 @@ async def test_thumbnail_comes_from_telegram_even_if_index_flag_is_stale(server,
         assert r.status_code == 200 and r.content == b"\xff\xd8JPEG-from-telegram" and r.headers["content-type"] == "image/jpeg"   # ... but Telegram has one
 
 
-async def test_thumbnail_falls_back_to_catalog_poster(server, indexed, store):
-    server.nothumb.add((CHAT2, 9102))
-    await store.upsert_doc(ex.message_to_doc(fake_msg(CHAT2, 9102, "document", name="Known.Movie.2020.mkv", size=5, mime="video/x-matroska"), "T"))
-    await store._db.dbs["storage_1"]["movie"].insert_one({"imdb_id": "tt1234567", "tmdb_id": 1, "title": "Known Movie", "poster": "https://image.tmdb.org/t/p/w500/abc.jpg",
-                                                "telegram": {"parts": [{"chat_id": 9998887776, "msg_id": 9102}]}})
-    async with httpx.AsyncClient() as c:
-        r = await c.get(f"{server.base}/_ex/thumb/{CHAT2}_9102", follow_redirects=False)
-        assert r.status_code == 302 and r.headers["location"] == "https://image.tmdb.org/t/p/w500/abc.jpg"
 
 
-async def test_thumbnail_miss_is_clean_and_cached(server, indexed, store):
-    server.nothumb.add((CHAT2, 9103))
-    await store.upsert_doc(ex.message_to_doc(fake_msg(CHAT2, 9103, "document", name="No.Artwork.mkv", size=5, mime="video/x-matroska"), "T"))
+
+# ------------------------------------------------------------------ thumbnails
+import shutil
+from Backend.helper import explorer_thumbs as TH
+
+async def _poll_thumb(c, server, fid, timeout=45):
+    """The endpoint answers 202 while a frame is being generated; keep asking like the page does."""
+    t0 = time.time()
+    while True:
+        r = await c.get(f"{server.base}/_ex/thumb/{fid}", follow_redirects=False)
+        if r.status_code != 202 or time.time() - t0 > timeout:
+            return r
+        await asyncio.sleep(0.4)
+
+
+def _jpeg_size(data):
+    import av, io
+    with av.open(io.BytesIO(data)) as c:
+        s = c.streams.video[0]
+        return s.width, s.height
+
+
+@pytest.fixture(scope="module")
+def real_videos(tmp_path_factory):
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg is only needed to create the sample videos for this test")
+    d = tmp_path_factory.mktemp("vids")
+    def mk(name, vargs, aargs, dur):
+        out = d / name
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"testsrc2=size=640x360:rate=25:duration={dur}",
+                        "-f", "lavfi", "-i", f"sine=duration={dur}"] + vargs + aargs + [str(out)], check=True, timeout=120)
+        return out
+    return {"mkv": mk("movie.mkv", ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "25"], ["-c:a", "ac3"], 12),
+            "hevc": mk("hevc.mkv", ["-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-x265-params", "log-level=none"], ["-c:a", "aac"], 5),
+            "tenbit": mk("ten.mkv", ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le", "-profile:v", "high10"], ["-c:a", "aac"], 6)}
+
+
+async def _add_video(server, store, mid, path, name):
+    server.files[(CHAT2, mid)] = path
+    server.nothumb.add((CHAT2, mid))                                   # Telegram has no thumbnail for it (typical MKV document)
+    await store.upsert_doc(ex.message_to_doc(fake_msg(CHAT2, mid, "document", name=name, size=path.stat().st_size, mime="video/x-matroska"), "T"))
+    return f"{CHAT2}_{mid}"
+
+
+async def test_mkv_without_telegram_thumbnail_gets_a_generated_frame(server, indexed, store, real_videos, monkeypatch):
+    from Backend.fastapi.routes import explorer_routes as er
+    if not TH.AVAILABLE:
+        pytest.skip("PyAV (package 'av') is not installed")
+    for k, mid in (("mkv", 9201), ("hevc", 9202), ("tenbit", 9203)):
+        fid = await _add_video(server, store, mid, real_videos[k], real_videos[k].name)
+        async with httpx.AsyncClient(timeout=60) as c:
+            first = await c.get(f"{server.base}/_ex/thumb/{fid}", follow_redirects=False)
+            assert first.status_code == 202 and first.json()["status"] == "pending", k          # answered at once, work happens in the background
+            r = await _poll_thumb(c, server, fid)
+            assert r.status_code == 200 and r.headers["content-type"] == "image/jpeg" and r.content[:2] == b"\xff\xd8", (k, r.status_code)
+            w, h = _jpeg_size(r.content)
+            assert 0 < w <= 480 and abs(w / h - 16 / 9) < 0.05, (k, w, h)                      # scaled, aspect ratio kept
+            assert len(r.content) < 80_000
+            er._thumb_cache.clear()                                                             # even after the in-memory copy is gone ...
+            assert os.path.exists(TH._path(fid))                                                # ... it is on disk
+            again = await c.get(f"{server.base}/_ex/thumb/{fid}")
+            assert again.status_code == 200 and again.content == r.content                      # instant, no regeneration
+
+
+async def test_generated_frame_is_not_black(server, indexed, store, tmp_path):
+    """Videos that open with black frames: the generator moves on to a later point."""
+    if not shutil.which("ffmpeg") or not TH.AVAILABLE:
+        pytest.skip("needs ffmpeg + PyAV")
+    out = tmp_path / "blackstart.mkv"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=640x360:r=25:d=40", "-f", "lavfi", "-i",
+                    "testsrc2=size=640x360:rate=25:duration=60", "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-pix_fmt", "yuv420p", "-g", "25", str(out)], check=True, timeout=120)
+    fid = await _add_video(server, store, 9210, out, "blackstart.mkv")
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await _poll_thumb(c, server, fid)
+    assert r.status_code == 200
+    import av, io
+    with av.open(io.BytesIO(r.content)) as ct:
+        frame = next(ct.decode(video=0))
+    lum = sum(bytes(frame.planes[0])[::13]) / len(bytes(frame.planes[0])[::13])
+    assert lum > 40, lum                                                                       # a real picture, not the black intro
+
+
+async def test_telegram_thumbnail_wins_and_no_generation_is_started(server, indexed, store):
+    server.thumbs[(CHAT2, 9220)] = b"\xff\xd8TG-THUMB"
+    await store.upsert_doc(ex.message_to_doc(fake_msg(CHAT2, 9220, "document", name="WithThumb.mkv", size=5, mime="video/x-matroska"), "T"))
     async with httpx.AsyncClient() as c:
-        before = server.calls["get_messages"]
-        assert (await c.get(f"{server.base}/_ex/thumb/{CHAT2}_9103")).status_code == 404
-        mid = server.calls["get_messages"]
-        assert (await c.get(f"{server.base}/_ex/thumb/{CHAT2}_9103")).status_code == 404
-        assert mid > before and server.calls["get_messages"] == mid          # 2nd request answered from the miss-cache, no Telegram call
-        assert (await c.get(f"{server.base}/_ex/thumb/not-an-id")).status_code == 400
+        r = await c.get(f"{server.base}/_ex/thumb/{CHAT2}_9220")
+        assert r.status_code == 200 and r.content == b"\xff\xd8TG-THUMB"
+    assert f"{CHAT2}_9220" not in TH._pending
+
+
+async def test_unreadable_video_ends_in_404_not_endless_pending(server, indexed, store, tmp_path):
+    if not TH.AVAILABLE:
+        pytest.skip("PyAV not installed")
+    junk = tmp_path / "junk.mkv"; junk.write_bytes(os.urandom(200_000))
+    fid = await _add_video(server, store, 9230, junk, "junk.mkv")
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await _poll_thumb(c, server, fid)
+        assert r.status_code == 404                                                            # gives up cleanly (the page then shows an icon)
+        calls = server.calls["get_messages"]
+        assert (await c.get(f"{server.base}/_ex/thumb/{fid}")).status_code == 404
+        assert server.calls["get_messages"] == calls and TH.state(fid) == "failed"            # failure remembered: no retry storm
+
+
+async def test_only_videos_are_generated_and_switch_works(server, indexed, store, monkeypatch):
+    server.nothumb.add((CHAT2, 9240)); server.nothumb.add((CHAT2, 9241))
+    await store.upsert_doc(ex.message_to_doc(fake_msg(CHAT2, 9240, "document", name="notes.pdf", size=5, mime="application/pdf"), "T"))
+    await store.upsert_doc(ex.message_to_doc(fake_msg(CHAT2, 9241, "document", name="Other.Movie.mkv", size=5, mime="video/x-matroska"), "T"))
+    async with httpx.AsyncClient() as c:
+        assert (await c.get(f"{server.base}/_ex/thumb/{CHAT2}_9240", follow_redirects=False)).status_code == 404   # documents: never generated
+        monkeypatch.setattr(TH, "ENABLED", False)                                                                   # EXPLORER_THUMBS=false
+        assert (await c.get(f"{server.base}/_ex/thumb/{CHAT2}_9241", follow_redirects=False)).status_code == 404
+
+
+async def test_catalog_poster_is_the_last_resort(server, indexed, store, monkeypatch):
+    server.nothumb.add((CHAT2, 9250))
+    await store.upsert_doc(ex.message_to_doc(fake_msg(CHAT2, 9250, "document", name="Known.Movie.2020.mkv", size=5, mime="video/x-matroska"), "T"))
+    await store._db.dbs["storage_1"]["movie"].insert_one({"imdb_id": "tt7654321", "tmdb_id": 2, "title": "Known Movie", "poster": "https://image.tmdb.org/t/p/w500/zzz.jpg",
+                                                          "telegram": {"parts": [{"chat_id": 9998887776, "msg_id": 9250}]}})
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await _poll_thumb(c, server, f"{CHAT2}_9250")                                        # generation fails (no real video) -> poster
+        assert r.status_code == 302 and r.headers["location"] == "https://image.tmdb.org/t/p/w500/zzz.jpg"
