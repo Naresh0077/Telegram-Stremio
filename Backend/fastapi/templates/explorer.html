@@ -711,14 +711,6 @@ async function commitRename(v) {
   try { await api('/api/explorer/folders/' + f.id, {method: 'PATCH', body: {name: v}}); await refreshSummary(); S.sel = new Set(['f:' + f.id]); load(true); }
   catch (e) { flash(e.message); render(); }
 }
-function renameFolderDialog(f) {
-  dlg('Rename folder', `<p style="margin-top:0">New name for “${esc(f.name)}”:</p><input type="text" id="renIn" value="${esc(f.name)}" maxlength="120">`,
-    [{l: 'Rename', pri: true, fn: async typed => {
-      const name = (typed || '').trim(); if (!name || name === f.name) return;
-      try { await api('/api/explorer/folders/' + f.id, {method: 'PATCH', body: {name}}); await refreshSummary(); load(true); flash(`Renamed to “${name}”`); }
-      catch (e) { msgbox('Cannot rename folder', e.message); }
-    }}, {l: 'Cancel'}]);
-}
 function deleteFolder(f) {
   dlg('Delete Folder', `<p style="margin-top:0">Are you sure you want to delete “${esc(f.name)}”?</p><p>Its files and subfolders move up one level. <b>Nothing is deleted from Telegram.</b></p>`,
     [{l: 'Delete', pri: true, fn: async () => { try { await api('/api/explorer/folders/' + f.id, {method: 'DELETE'}); S.sel.clear(); if (S.view.t === 'folder' && S.view.id === f.id) go({t: 'folders'}); else { await refreshSummary(); load(true); } } catch (e) { flash(e.message); } }}, {l: 'Cancel'}]);
@@ -788,7 +780,7 @@ const ACT = {
   fullsync: () => dlg('Full re-index', '<p style="margin:0">Re-scan every message from the beginning? This can take a while on large channels and also removes entries for deleted messages.</p>', [{l: 'Re-index', pri: true, fn: () => startSync(true)}, {l: 'Cancel'}]),
   vlcsetup: () => vlcSetup(null), admin: () => { location.href = '/'; },
   mclose: () => { S.modal = null; },
-  mbtn: v => { const b = (S.modal.btns || [{l: 'Close'}])[+v]; const box = $('#modal input[type=text]'); const typed = box ? box.value : null; S.modal = null; render(); if (b && b.fn) b.fn(typed); return 'done'; },
+  mbtn: v => { const b = (S.modal.btns || [{l: 'Close'}])[+v]; S.modal = null; render(); if (b && b.fn) b.fn(); return 'done'; },
   drawer: () => { S.drawer = !S.drawer; },
   msearch: () => { S.msearch = true; setTimeout(() => { const i = $('#mq'); if (i) i.focus(); }, 30); },
   msclose: () => { S.msearch = false; if (S.q) { S.q = ''; $('#q').value = ''; $('#mq').value = ''; syncUrl(true); load(true); } },
@@ -843,13 +835,6 @@ document.addEventListener('contextmenu', e => {
   const el = e.target.closest('[data-a="sel"]');
   if (e.target.closest('#modal,#details,.viewer,#ribbon,#addrrow,#status')) return;
   e.preventDefault();
-  const navFolder = e.target.closest('#nav [data-fk]');
-  if (navFolder) {
-    const f = S.folders.find(x => x.id === navFolder.dataset.fk); if (!f) return;
-    return showMenu(e, [{label: 'Open', fn: () => go({t: 'folder', id: f.id})},
-      {label: 'Copy folder link', fn: () => { const u = location.origin + viewToPath({t: 'folder', id: f.id}); (navigator.clipboard ? navigator.clipboard.writeText(u) : Promise.reject()).then(() => flash('Folder link copied'), () => dlg('Folder link', `<input type="text" readonly value="${esc(u)}" onclick="this.select()">`, [{l: 'Close'}])); }},
-      '-', {label: 'Rename', fn: () => renameFolderDialog(f)}, {label: 'Delete', fn: () => deleteFolder(f)}]);
-  }
   if (!el) { if (e.target.closest('#main')) { S.sel.clear(); render(); showMenu(e, [{label: 'View: Large icons', fn: () => { ACT.view('icons'); render(); }}, {label: 'View: Details', fn: () => { ACT.view('details'); render(); }}, '-', {label: 'Refresh', fn: () => ACT.refresh()}, '-', {label: 'New folder', fn: newFolder}]); } return; }
   const k = el.dataset.v; if (!S.sel.has(k)) { S.sel = new Set([k]); render(); }
   const one = sel1(), files = selFiles();
@@ -895,7 +880,6 @@ document.addEventListener('touchend', lpEnd); document.addEventListener('touchca
 /* ---------- keyboard ---------- */
 document.addEventListener('keydown', e => {
   if (e.target.id === 'ri') { if (e.key === 'Enter') { e.preventDefault(); commitRename(e.target.value); } if (e.key === 'Escape') { S.ren = null; render(); } return; }
-  if (e.target.id === 'renIn') { if (e.key === 'Enter') { e.preventDefault(); const ok = $('#modal .btn.pri'); if (ok) ok.click(); } return; }
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
   if (document.querySelector('.viewer')) return;
   if (S.modal) { if (e.key === 'Escape') { S.modal = null; render(); } return; }
