@@ -1,30 +1,35 @@
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from Backend.helper.explorer import configured_channels, get_store, message_to_doc
+from Backend.helper.explorer import configured_channels, get_store, message_to_doc, topic_id_of, topic_name_for
 from Backend.logger import LOGGER
 
+#----- Channels AND groups (incl. groups with Topics) are watched; the id must still be one the Explorer is set up for.
+_WATCH = filters.channel | filters.group
 
-#----- Keep the File Explorer index live: every attachment posted to a configured channel is indexed.
+
+#----- Keep the File Explorer index live: every attachment posted to a configured channel/group is indexed.
 #----- Runs in its own handler group, so the existing receiver (movie/TV indexing) is unaffected.
-@Client.on_message(filters.channel & filters.media, group=50)
+@Client.on_message(_WATCH & filters.media, group=50)
 async def explorer_index_new(client: Client, message: Message):
     try:
         if message.chat.id not in configured_channels():
             return
-        doc = message_to_doc(message, getattr(message.chat, "title", "") or "")
+        tid = topic_id_of(message)
+        tname = await topic_name_for(client, message.chat.id, tid) if tid else ""
+        doc = message_to_doc(message, getattr(message.chat, "title", "") or "", tname)
         if doc:
             await get_store().upsert_doc(doc)
     except Exception as e:
         LOGGER.warning(f"[Explorer] live index failed for message {getattr(message, 'id', '?')}: {e}")
 
 
-@Client.on_edited_message(filters.channel & filters.media, group=50)
+@Client.on_edited_message(_WATCH & filters.media, group=50)
 async def explorer_index_edited(client: Client, message: Message):
     await explorer_index_new(client, message)
 
 
-@Client.on_deleted_messages(filters.channel, group=50)
+@Client.on_deleted_messages(_WATCH, group=50)
 async def explorer_index_deleted(client: Client, messages: list[Message]):
     try:
         allowed = configured_channels()
