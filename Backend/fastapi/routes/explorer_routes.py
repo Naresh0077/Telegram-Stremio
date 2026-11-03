@@ -161,11 +161,11 @@ async def api_summary(_: bool = Depends(require_auth)):
 @router.get("/api/explorer/files")
 async def api_files(kind: str = "", channel: Optional[int] = None, folder: str = "", fav: bool = False,
                     q: str = "", ext: str = "", sort: str = "date", order: str = "desc",
-                    page: int = 1, limit: int = 60, _: bool = Depends(require_auth)):
+                    page: int = 1, limit: int = 60, topic: Optional[int] = None, _: bool = Depends(require_auth)):
     if kind and kind != "all" and kind not in KINDS:
         raise HTTPException(status_code=400, detail="Unknown kind")
     return await get_store().list_files(kind=kind, channel=channel, folder_id=folder or None, fav=fav, q=q,
-                                        ext=ext, sort=sort, order=order, page=page, limit=limit)
+                                        ext=ext, sort=sort, order=order, page=page, limit=limit, topic=topic)
 
 
 @router.post("/api/explorer/sync")
