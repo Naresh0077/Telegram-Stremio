@@ -120,8 +120,19 @@ def extract_media(message) -> Tuple[Optional[str], Any]:
 _SYNTH_EXT = {"voice": "ogg", "video_note": "mp4", "animation": "mp4", "photo": "jpg", "video": "mp4", "audio": "mp3"}
 
 
+#----- Forum topic id of a message (None when the chat has no topics). The "General" topic is id 1.
+def topic_id_of(message) -> Optional[int]:
+    tid = getattr(message, "message_thread_id", None)
+    if tid:
+        return int(tid)
+    chat = getattr(message, "chat", None)
+    if chat is not None and getattr(getattr(chat, "type", None), "name", "") == "FORUM":
+        return 1
+    return None
+
+
 #----- Convert a pyrogram Message into an index document (None when it has no attachment)
-def message_to_doc(message, channel_name: str = "") -> Optional[dict]:
+def message_to_doc(message, channel_name: str = "", topic_name: str = "") -> Optional[dict]:
     if message is None or getattr(message, "empty", False):
         return None
     attr, obj = extract_media(message)
@@ -166,6 +177,8 @@ def message_to_doc(message, channel_name: str = "") -> Optional[dict]:
         "has_thumb": bool(getattr(obj, "thumbs", None)) or attr == "photo",
         "synthetic_name": synthetic,
         "channel_name": channel_name or "",
+        "topic_id": topic_id_of(message),
+        "topic_name": topic_name or "",
     }
 
 
@@ -189,6 +202,8 @@ def public_doc(doc: dict) -> dict:
         "height": doc.get("height", 0),
         "has_thumb": bool(doc.get("has_thumb")),
         "channel": doc.get("channel_name") or str(doc.get("chat_id")),
+        "topic_id": doc.get("topic_id"),
+        "topic": doc.get("topic_name") or "",
         "folder_id": doc.get("folder_id"),
         "favorite": bool(doc.get("fav")),
     }
@@ -228,6 +243,7 @@ class ExplorerStore:
             await f.create_index([("size", -1)])
             await f.create_index([("folder_id", 1)])
             await f.create_index([("fav", 1)])
+            await f.create_index([("chat_id", 1), ("topic_id", 1)])
             self._indexes_ready = True
         except Exception as e:
             LOGGER.warning(f"[Explorer] index creation failed: {e}")
@@ -236,6 +252,8 @@ class ExplorerStore:
     async def upsert_doc(self, doc: dict) -> None:
         d = dict(doc)
         _id = d.pop("_id")
+        if not d.get("topic_name"):
+            d.pop("topic_name", None)
         d["indexed_at"] = _now()
         #----- folder_id / fav are only set on insert so re-indexing never undoes the user's organisation
         await self.files.update_one(
@@ -256,7 +274,7 @@ class ExplorerStore:
     #----- Listing / search / pagination
     @staticmethod
     def build_query(kind: str = "", channel: Optional[int] = None, folder_id: Optional[str] = None,
-                    fav: bool = False, q: str = "", ext: str = "") -> dict:
+                    fav: bool = False, q: str = "", ext: str = "", topic: Optional[int] = None) -> dict:
         query: Dict[str, Any] = {}
         if kind and kind != "all":
             query["kind"] = kind
@@ -264,6 +282,9 @@ class ExplorerStore:
             query["chat_id"] = int(channel)
         if folder_id:
             query["folder_id"] = folder_id
+        if topic is not None:
+            #----- 0 = only files that are not inside any topic
+            query["topic_id"] = int(topic) if int(topic) != 0 else None
         if fav:
             query["fav"] = True
         if ext:
@@ -276,8 +297,8 @@ class ExplorerStore:
 
     async def list_files(self, *, kind: str = "", channel: Optional[int] = None, folder_id: Optional[str] = None,
                          fav: bool = False, q: str = "", ext: str = "", sort: str = "date", order: str = "desc",
-                         page: int = 1, limit: int = 60) -> dict:
-        query = self.build_query(kind, channel, folder_id, fav, q, ext)
+                         page: int = 1, limit: int = 60, topic: Optional[int] = None) -> dict:
+        query = self.build_query(kind, channel, folder_id, fav, q, ext, topic)
         limit = max(1, min(int(limit or 60), 200))
         page = max(1, int(page or 1))
         direction = 1 if order == "asc" else -1
@@ -304,9 +325,20 @@ class ExplorerStore:
         ]):
             channels.append({"chat_id": row["_id"], "name": row.get("name") or str(row["_id"]),
                              "count": row["n"], "size": row.get("size", 0)})
+        topics = []
+        async for row in self.files.aggregate([
+            {"$match": {"topic_id": {"$ne": None}}},
+            {"$group": {"_id": {"c": "$chat_id", "t": "$topic_id"}, "n": {"$sum": 1}, "size": {"$sum": "$size"},
+                        "name": {"$max": "$topic_name"}}},
+            {"$sort": {"_id.c": 1, "_id.t": 1}},
+        ]):
+            tid = row["_id"]["t"]
+            topics.append({"chat_id": row["_id"]["c"], "topic_id": tid,
+                           "name": row.get("name") or ("General" if tid == 1 else f"Topic {tid}"),
+                           "count": row["n"], "size": row.get("size", 0)})
         favs = await self.files.count_documents({"fav": True})
         total = await self.files.count_documents({})
-        return {"total": total, "kinds": kinds, "channels": channels, "favorites": favs,
+        return {"total": total, "kinds": kinds, "channels": channels, "favorites": favs, "topics": topics,
                 "folders": await self.list_folders()}
 
     #----- Virtual folders (nested, stored separately from Telegram)
@@ -413,6 +445,46 @@ class ExplorerStore:
         imdb = doc.get("imdb_id") or ""
         content_id = imdb if str(imdb).startswith("tt") else (f"tmdb:{doc.get('tmdb_id')}" if doc.get("tmdb_id") is not None else "")
         return {"content_id": content_id, "title": doc.get("title") or "", "poster": doc.get("poster") or ""}
+
+
+#----- Forum topic names (cached per chat; looked up with the bot, never needs the userbot)
+_topic_names: Dict[int, Dict[int, str]] = {}
+
+
+async def topic_name_for(client, chat_id: int, topic_id: Optional[int], force: bool = False) -> str:
+    if not topic_id:
+        return ""
+    names = _topic_names.setdefault(int(chat_id), {})
+    if topic_id == 1 and 1 not in names:
+        names[1] = "General"
+    if topic_id in names and not force:
+        return names[topic_id]
+    try:
+        t = await client.get_forum_topics_by_id(int(chat_id), int(topic_id))
+        if isinstance(t, list):
+            t = t[0] if t else None
+        title = getattr(t, "title", None)
+        if title:
+            names[topic_id] = title
+            return title
+    except Exception as e:
+        LOGGER.debug(f"[Explorer] topic name lookup failed for {chat_id}/{topic_id}: {e}")
+    return names.get(topic_id, "")
+
+
+async def refresh_topic_names(client, chat_id: int) -> int:
+    """Reads every topic title of a forum chat and stores it on the already indexed files."""
+    try:
+        n = 0
+        async for t in client.get_forum_topics(int(chat_id)):
+            _topic_names.setdefault(int(chat_id), {})[int(t.id)] = t.title
+            await get_store().files.update_many({"chat_id": int(chat_id), "topic_id": int(t.id)},
+                                                {"$set": {"topic_name": t.title}})
+            n += 1
+        return n
+    except Exception as e:
+        LOGGER.debug(f"[Explorer] topic list failed for {chat_id}: {e}")
+        return 0
 
 
 #----- Incremental channel indexer (bots cannot read history, so - like the existing scanner -
@@ -554,7 +626,8 @@ class ExplorerIndexer:
                     continue
                 had_content = True
                 max_seen = max(max_seen, mid)
-                doc = message_to_doc(m, name)
+                tname = await topic_name_for(client, chat_id, topic_id_of(m)) if topic_id_of(m) else ""
+                doc = message_to_doc(m, name, tname)
                 if doc:
                     await self.store.upsert_doc(doc)
                     st["counters"]["indexed"] += 1
@@ -567,6 +640,7 @@ class ExplorerIndexer:
             if use_probe and last_id:
                 st["progress"] = min(100, int(current / last_id * 100))
             await asyncio.sleep(SCAN_BATCH_DELAY)
+        await refresh_topic_names(client, chat_id)
         st["progress"] = 100 if not self._cancel else st["progress"]
 
 
@@ -601,4 +675,10 @@ def configured_channels() -> List[int]:
             v = int(c)
             if v not in out:
                 out.append(v)
+    #----- Explorer-only extra chats (e.g. a Topics group). They are NOT added to AUTH_CHANNEL, so the Stremio
+    #----- receiver / admin panel never see them. Comma-separated chat ids in config.env: EXPLORER_EXTRA_CHATS
+    for c in os.environ.get("EXPLORER_EXTRA_CHATS", "").split(","):
+        c = c.strip()
+        if c.lstrip("-").isdigit() and int(c) not in out:
+            out.append(int(c))
     return out
