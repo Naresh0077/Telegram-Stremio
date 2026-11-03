@@ -447,44 +447,87 @@ class ExplorerStore:
         return {"content_id": content_id, "title": doc.get("title") or "", "poster": doc.get("poster") or ""}
 
 
-#----- Forum topic names (cached per chat; looked up with the bot, never needs the userbot)
+#----- Forum topic names (cached per chat). A topic's id is the id of its "topic created" service message, so the
+#----- name can be read with a plain get_messages (works for bots). The userbot / forum-topic API are fallbacks.
 _topic_names: Dict[int, Dict[int, str]] = {}
+
+
+def _title_of(m) -> str:
+    for attr in ("forum_topic_created", "forum_topic_edited"):
+        obj = getattr(m, attr, None)
+        title = getattr(obj, "title", None) or getattr(obj, "name", None)
+        if title:
+            return str(title)
+    return ""
+
+
+def remember_topic(chat_id: int, m) -> None:
+    """Called while scanning: a topic-created service message names the topic whose id equals the message id."""
+    fc = getattr(m, "forum_topic_created", None)
+    title = getattr(fc, "title", None) or getattr(fc, "name", None)
+    if title:
+        _topic_names.setdefault(int(chat_id), {})[int(m.id)] = str(title)
 
 
 async def topic_name_for(client, chat_id: int, topic_id: Optional[int], force: bool = False) -> str:
     if not topic_id:
         return ""
-    names = _topic_names.setdefault(int(chat_id), {})
-    if topic_id == 1 and 1 not in names:
-        names[1] = "General"
+    chat_id, topic_id = int(chat_id), int(topic_id)
+    names = _topic_names.setdefault(chat_id, {})
     if topic_id in names and not force:
         return names[topic_id]
+    if topic_id == 1:
+        names[1] = "General"
+        return "General"
+    #----- 1) the "topic created" message (id == topic id)
     try:
-        t = await client.get_forum_topics_by_id(int(chat_id), int(topic_id))
-        if isinstance(t, list):
-            t = t[0] if t else None
-        title = getattr(t, "title", None)
+        m = await client.get_messages(chat_id, topic_id)
+        if isinstance(m, list):
+            m = m[0] if m else None
+        title = _title_of(m) if m is not None else ""
         if title:
             names[topic_id] = title
             return title
     except Exception as e:
-        LOGGER.debug(f"[Explorer] topic name lookup failed for {chat_id}/{topic_id}: {e}")
+        LOGGER.debug(f"[Explorer] topic message lookup failed for {chat_id}/{topic_id}: {e}")
+    #----- 2) forum-topic API, with the userbot first and then the given client
+    clients = []
+    try:
+        import Backend.pyrofork.bot as botmod
+        if botmod.Userbot is not None:
+            clients.append(botmod.Userbot)
+    except Exception:
+        pass
+    clients.append(client)
+    for c in clients:
+        try:
+            t = await c.get_forum_topics_by_id(chat_id, topic_id)
+            if isinstance(t, list):
+                t = t[0] if t else None
+            title = getattr(t, "title", None)
+            if title:
+                names[topic_id] = str(title)
+                return str(title)
+        except Exception as e:
+            LOGGER.debug(f"[Explorer] topic api lookup failed for {chat_id}/{topic_id}: {e}")
+    LOGGER.warning(f"[Explorer] could not find the name of topic {topic_id} in {chat_id}")
     return names.get(topic_id, "")
 
 
 async def refresh_topic_names(client, chat_id: int) -> int:
-    """Reads every topic title of a forum chat and stores it on the already indexed files."""
+    """Looks up the name of every topic that has indexed files and stores it on those files."""
+    n = 0
     try:
-        n = 0
-        async for t in client.get_forum_topics(int(chat_id)):
-            _topic_names.setdefault(int(chat_id), {})[int(t.id)] = t.title
-            await get_store().files.update_many({"chat_id": int(chat_id), "topic_id": int(t.id)},
-                                                {"$set": {"topic_name": t.title}})
-            n += 1
-        return n
+        ids = await get_store().files.distinct("topic_id", {"chat_id": int(chat_id), "topic_id": {"$ne": None}})
+        for tid in ids:
+            name = await topic_name_for(client, chat_id, int(tid), force=True)
+            if name:
+                await get_store().files.update_many({"chat_id": int(chat_id), "topic_id": int(tid)},
+                                                    {"$set": {"topic_name": name}})
+                n += 1
     except Exception as e:
-        LOGGER.debug(f"[Explorer] topic list failed for {chat_id}: {e}")
-        return 0
+        LOGGER.warning(f"[Explorer] topic name refresh failed for {chat_id}: {e}")
+    return n
 
 
 #----- Incremental channel indexer (bots cannot read history, so - like the existing scanner -
@@ -626,6 +669,7 @@ class ExplorerIndexer:
                     continue
                 had_content = True
                 max_seen = max(max_seen, mid)
+                remember_topic(chat_id, m)
                 tname = await topic_name_for(client, chat_id, topic_id_of(m)) if topic_id_of(m) else ""
                 doc = message_to_doc(m, name, tname)
                 if doc:
