@@ -326,8 +326,12 @@ applyTheme();
 const RES = {'home': {t: 'home'}, 'all files': {t: 'all'}, 'favorites': {t: 'fav'}, 'folders': {t: 'folders'}};
 KINDS.forEach(([k, n]) => { RES[n.toLowerCase()] = {t: 'kind', k}; });
 function folderPath(id) { const out = []; let cur = S.folders.find(f => f.id === id); while (cur) { out.unshift(cur); cur = S.folders.find(f => f.id === cur.parent_id); } return out; }
+const topicsOf = chat => (S.sum?.topics || []).filter(t => t.chat_id === chat);
+const topicRow = t => ({k: 'f:tp_' + t.chat_id + '_' + t.topic_id, f: 1, tp: 1, id: 'tp_' + t.chat_id + '_' + t.topic_id, chat_id: t.chat_id, topic_id: t.topic_id, name: t.name, count: t.count});
+const topicView = r => ({t: 'topic', id: r.chat_id, tid: r.topic_id});
 function viewToPath(v) {
   switch (v.t) {
+    case 'topic': { const c = (S.sum?.channels || []).find(c => c.chat_id === v.id); const t = topicsOf(v.id).find(t => t.topic_id === v.tid); return '/explorer/Channels/' + enc(c ? c.name : String(v.id)) + '/' + enc(t ? t.name : 'Topic ' + v.tid); }
     case 'all': return '/explorer/All%20Files';
     case 'fav': return '/explorer/Favorites';
     case 'folders': return '/explorer/Folders';
@@ -341,7 +345,7 @@ function pathToView(pathname) {
   const segs = pathname.replace(/^\/explorer\/?/, '').split('/').filter(Boolean).map(s => { try { return decodeURIComponent(s); } catch (e) { return s; } });
   if (!segs.length) return {t: 'home'};
   const k = segs[0].toLowerCase();
-  if (k === 'channels') { if (!segs[1]) return {t: 'home'}; const c = (S.sum?.channels || []).find(c => c.name.toLowerCase() === segs[1].toLowerCase() || String(c.chat_id) === segs[1]); return c ? {t: 'channel', id: c.chat_id} : null; }
+  if (k === 'channels') { if (!segs[1]) return {t: 'home'}; const c = (S.sum?.channels || []).find(c => c.name.toLowerCase() === segs[1].toLowerCase() || String(c.chat_id) === segs[1]); if (!c) return null; if (!segs[2]) return {t: 'channel', id: c.chat_id}; const tp = topicsOf(c.chat_id).find(t => t.name.toLowerCase() === segs[2].toLowerCase() || String(t.topic_id) === segs[2]); return tp ? {t: 'topic', id: c.chat_id, tid: tp.topic_id} : null; }
   if (segs.length === 1 && RES[k]) return RES[k];
   let parent = null, cur = null;
   for (const seg of segs) { cur = S.folders.find(f => (f.parent_id || null) === parent && f.name.toLowerCase() === seg.toLowerCase()); if (!cur) return null; parent = cur.id; }
@@ -355,6 +359,7 @@ function crumbParts() {
   else if (v.t === 'kind') parts.push([KNAME[v.k], v]);
   else if (v.t === 'fav') parts.push(['Favorites', v]);
   else if (v.t === 'channel') parts.push([(S.sum?.channels.find(c => c.chat_id === v.id)?.name) || 'Channel', v]);
+  else if (v.t === 'topic') { parts.push([(S.sum?.channels.find(c => c.chat_id === v.id)?.name) || 'Channel', {t: 'channel', id: v.id}]); parts.push([topicsOf(v.id).find(t => t.topic_id === v.tid)?.name || 'Topic ' + v.tid, v]); }
   else if (v.t === 'folders') parts.push(['Folders', v]);
   else if (v.t === 'folder') { parts.push(['Folders', {t: 'folders'}]); folderPath(v.id).forEach(f => parts.push([f.name, {t: 'folder', id: f.id}])); }
   if (S.q) parts.push(['Search Results in ' + parts[parts.length - 1][0], null]);
@@ -384,13 +389,14 @@ function queryFor(page) {
   if (v.t === 'kind') p.set('kind', v.k);
   if (v.t === 'fav') p.set('fav', 'true');
   if (v.t === 'folder') p.set('folder', v.id);
-  if (v.t === 'channel') p.set('channel', v.id);
+  if (v.t === 'channel') { p.set('channel', v.id); if (!S.q && topicsOf(v.id).length) p.set('topic', 0); }
+  if (v.t === 'topic') { p.set('channel', v.id); p.set('topic', v.tid); }
   if (S.kind && v.t !== 'kind') p.set('kind', S.kind);
-  if (S.chan && v.t !== 'channel') p.set('channel', S.chan);
+  if (S.chan && v.t !== 'channel' && v.t !== 'topic') p.set('channel', S.chan);
   if (S.q) p.set('q', S.q);
   return p.toString();
 }
-const subfolders = () => { const v = S.view; if (S.q) return []; if (v.t === 'folders') return S.folders.filter(f => !f.parent_id); if (v.t === 'folder') return S.folders.filter(f => f.parent_id === v.id); return []; };
+const subfolders = () => { const v = S.view; if (S.q) return []; if (v.t === 'folders') return S.folders.filter(f => !f.parent_id); if (v.t === 'folder') return S.folders.filter(f => f.parent_id === v.id); if (v.t === 'channel') return topicsOf(v.id).map(topicRow); return []; };
 async function load(reset) {
   const gen = ++S.gen;
   if (reset) { S.items = []; S.total = 0; S.page = 0; S.done = false; S.loading = false; S.sel.clear(); }
@@ -415,11 +421,11 @@ async function load(reset) {
 
 /* ---------- selection model: folders are keyed "f:<id>", files by their id ---------- */
 const fkey = f => 'f:' + f.id;
-const rows = () => [...subfolders().map(f => ({k: fkey(f), f: 1, id: f.id, name: f.name, count: f.count})), ...S.items.map(i => Object.assign({k: i.id, f: 0}, i))];
-const byKey = k => { if (k.startsWith('f:')) { const f = S.folders.find(x => x.id === k.slice(2)); return f && {k, f: 1, id: f.id, name: f.name, count: f.count}; } return S.items.find(i => i.id === k); };
+const rows = () => [...subfolders().map(f => f.tp ? f : ({k: fkey(f), f: 1, id: f.id, name: f.name, count: f.count})), ...S.items.map(i => Object.assign({k: i.id, f: 0}, i))];
+const byKey = k => { if (k.startsWith('f:tp_')) { const m = /^f:tp_(-?\d+)_(\d+)$/.exec(k); const t = m && topicsOf(+m[1]).find(t => t.topic_id === +m[2]); return t && topicRow(t); } if (k.startsWith('f:')) { const f = S.folders.find(x => x.id === k.slice(2)); return f && {k, f: 1, id: f.id, name: f.name, count: f.count}; } return S.items.find(i => i.id === k); };
 const selFiles = () => [...S.sel].map(k => S.items.find(i => i.id === k)).filter(Boolean);
 const selFolder = () => { if (S.sel.size !== 1) return null; const k = [...S.sel][0]; return k.startsWith('f:') ? S.folders.find(f => f.id === k.slice(2)) : null; };
-const sel1 = () => { if (S.sel.size !== 1) return null; const k = [...S.sel][0]; return k.startsWith('f:') ? {f: 1, ...S.folders.find(f => f.id === k.slice(2))} : S.items.find(i => i.id === k); };
+const sel1 = () => { if (S.sel.size !== 1) return null; const k = [...S.sel][0]; if (k.startsWith('f:tp_')) return byKey(k) || null; return k.startsWith('f:') ? {f: 1, ...S.folders.find(f => f.id === k.slice(2))} : S.items.find(i => i.id === k); };
 
 /* ---------- rendering ---------- */
 const rb = (i, l, a, x = {}) => `<button class="rb${x.on ? ' on' : ''}" data-a="${a}" ${x.v != null ? `data-v="${esc(x.v)}"` : ''} ${x.d ? 'disabled' : ''}>${ic(i, 26, x.c || '#3FA0F0')}<span>${l}</span></button>`;
@@ -451,7 +457,7 @@ function addr() {
   $('#addrL').innerHTML = `<button class="nb" data-a="back">${ic('arrow-left', 16)}</button><button class="nb" data-a="fwd">${ic('arrow-right', 16)}</button><button class="nb" data-a="rec" style="width:16px">${ic('chevron-down', 10)}</button><button class="nb" data-a="up" ${can ? '' : 'disabled'}>${ic('arrow-up', 16)}</button>`
     + (S.menu ? `<div class="menu" style="position:absolute;top:28px;left:0;z-index:10">${S.recent.map((r, i) => `<div class="mi" data-a="recgo" data-v="${i}">${esc(r.label)}</div>`).join('') || '<div class="mi off">No recent locations</div>'}</div>` : '');
   const parts = crumbParts(), v = S.view;
-  const icon = v.t === 'folder' || v.t === 'folders' ? FOLDER_IC(16) : v.t === 'kind' ? ic(KDEF[v.k][0], 16, KDEF[v.k][1]) : v.t === 'fav' ? ic('star', 16, '#F5B301', '#F5B301', 1) : v.t === 'channel' ? ic('send', 16, '#2aabee') : ic('monitor', 16, '#2B88D8');
+  const icon = v.t === 'folder' || v.t === 'folders' ? FOLDER_IC(16) : v.t === 'kind' ? ic(KDEF[v.k][0], 16, KDEF[v.k][1]) : v.t === 'fav' ? ic('star', 16, '#F5B301', '#F5B301', 1) : (v.t === 'channel' || v.t === 'topic') ? ic('send', 16, '#2aabee') : ic('monitor', 16, '#2B88D8');
   $('#crumbs').innerHTML = `<span style="padding:0 6px;display:flex">${icon}</span><div class="fx ac grow" style="overflow:hidden">`
     + parts.map((p, i) => `<button class="cr" ${p[1] ? `data-a="go" data-v="${esc(JSON.stringify(p[1]))}"` : ''}>${esc(p[0])}</button>${i < parts.length - 1 ? ic('chevron-right', 9, '#aaa') : ''}`).join('')
     + `</div><button class="nb" data-a="refresh" style="height:24px">${ic('refresh', 14)}</button>`;
@@ -476,7 +482,7 @@ function nav() {
   if (o.has('PC')) h += KINDS.map(([k, n, i, c]) => nv(1, 'k' + k, n, ic(i, 16, c), {t: 'kind', k}, false)).join('');
   h += nv(0, 'FOLD', 'Folders', FOLDER_IC(16), {t: 'folders'}, S.folders.length > 0, 'data-drop="root"');
   if (o.has('FOLD')) h += tree(null, 1);
-  if (S.sum && S.sum.channels.length) { h += nv(0, 'NET', 'Telegram channels', ic('network', 16, '#2B88D8'), null, true); if (o.has('NET')) h += S.sum.channels.map(c => nv(1, 'c' + c.chat_id, c.name, ic('send', 16, '#2aabee'), {t: 'channel', id: c.chat_id}, false)).join(''); }
+  if (S.sum && S.sum.channels.length) { h += nv(0, 'NET', 'Telegram channels', ic('network', 16, '#2B88D8'), null, true); if (o.has('NET')) h += S.sum.channels.map(c => { const tps = topicsOf(c.chat_id); return nv(1, 'c' + c.chat_id, c.name, ic('send', 16, '#2aabee'), {t: 'channel', id: c.chat_id}, tps.length > 0) + (tps.length && o.has('c' + c.chat_id) ? tps.map(t => nv(2, 'tp' + c.chat_id + '_' + t.topic_id, t.name, FOLDER_IC(16), {t: 'topic', id: c.chat_id, tid: t.topic_id}, false)).join('') : ''); }).join(''); }
   const nvEl = $('#nav');
   if (isM()) { nvEl.style.display = ''; nvEl.classList.toggle('open', S.drawer); document.body.classList.toggle('drawer', S.drawer); }
   else { nvEl.classList.remove('open'); nvEl.style.display = S.showNav ? '' : 'none'; }
@@ -514,16 +520,16 @@ function thDone(id, v) {
 }
 const thReset = () => { TH.q.forEach(j => TH.seen.delete(j.id)); TH.q.length = 0; };
 const tileHtml = r => r.f
-  ? `<div class="tile it${S.sel.has(r.k) ? ' sel' : ''}" data-a="sel" data-v="${r.k}" data-fk="${r.id}" data-drop="${r.id}" title="${esc(r.name)}\n${r.count} item${r.count === 1 ? '' : 's'}"><div class="tb">${FOLDER_IC(64)}</div><span class="n">${nameCell(r)}</span></div>`
+  ? `<div class="tile it${S.sel.has(r.k) ? ' sel' : ''}" data-a="sel" data-v="${r.k}" ${r.tp ? '' : `data-fk="${r.id}" data-drop="${r.id}"`} title="${esc(r.name)}\n${r.count} item${r.count === 1 ? '' : 's'}"><div class="tb">${FOLDER_IC(64)}</div><span class="n">${nameCell(r)}</span></div>`
   : `<div class="tile it${S.sel.has(r.k) ? ' sel' : ''}" data-a="sel" data-v="${r.id}" data-id="${r.id}" draggable="true" title="${esc(tip(r))}">${r.favorite ? `<span class="st">${ic('star', 13, '#F5B301', '#F5B301', 1)}</span>` : ''}<div class="tb">${iconOf(r, 56)}${thumbImg(r)}${r.kind === 'video' && r.duration ? `<span class="bd">${fmtDur(r.duration)}</span>` : ''}</div><span class="n">${esc(dn(r))}</span></div>`;
 const rowHtml = r => r.f
-  ? `<div class="row it${S.sel.has(r.k) ? ' sel' : ''}" data-a="sel" data-v="${r.k}" data-fk="${r.id}" data-drop="${r.id}"><div class="fx ac" style="gap:6px">${FOLDER_IC(16)}<span class="trunc">${nameCell(r)}</span></div><div></div><div>File folder</div><div style="text-align:right"></div><div></div></div>`
+  ? `<div class="row it${S.sel.has(r.k) ? ' sel' : ''}" data-a="sel" data-v="${r.k}" ${r.tp ? '' : `data-fk="${r.id}" data-drop="${r.id}"`}><div class="fx ac" style="gap:6px">${FOLDER_IC(16)}<span class="trunc">${nameCell(r)}</span></div><div></div><div>File folder</div><div style="text-align:right"></div><div></div></div>`
   : `<div class="row it${S.sel.has(r.k) ? ' sel' : ''}" data-a="sel" data-v="${r.id}" data-id="${r.id}" draggable="true" title="${esc(tip(r))}"><div class="fx ac" style="gap:6px">${iconOf(r, 16)}<span class="trunc">${esc(dn(r))}</span>${r.favorite ? ic('star', 11, '#F5B301', '#F5B301', 1) : ''}</div><div>${fmtD(r.date)}</div><div>${esc(typeOf(r))}</div><div style="text-align:right">${fmtSize(r.size)}</div><div class="trunc">${esc(r.channel)}</div></div>`;
 const metaOf = r => r.f ? `${r.count} item${r.count === 1 ? '' : 's'}` : [fmtBig(r.size), (fmtD(r.date).split(' ')[0] || ''), r.channel].filter(x => x && x !== '—').join(' · ');
 const mrowHtml = r => {
   const on = S.sel.has(r.k);
   const th = r.f ? `<div class="mth">${FOLDER_IC(34)}</div>` : `<div class="mth">${iconOf(r, 28)}${thumbImg(r)}</div>`;
-  return `<div class="mrow it${on ? ' sel' : ''}" data-a="sel" data-v="${r.k}" ${r.f ? `data-fk="${r.id}"` : `data-id="${r.id}"`}>${th}<div class="mtx"><div class="mn">${S.ren === r.k ? `<input id="ri" class="ri" value="${esc(r.name)}">` : esc(r.f ? r.name : dn(r))}${!r.f && r.favorite ? ' ' + ic('star', 11, '#F5B301', '#F5B301', 1) : ''}</div><div class="mm">${esc(metaOf(r))}</div></div>${S.selMode ? `<span class="mck">${ic('check', 14, 'currentColor', 'none', 2.6)}</span>` : ''}</div>`;
+  return `<div class="mrow it${on ? ' sel' : ''}" data-a="sel" data-v="${r.k}" ${r.f ? (r.tp ? '' : `data-fk="${r.id}"`) : `data-id="${r.id}"`}>${th}<div class="mtx"><div class="mn">${S.ren === r.k ? `<input id="ri" class="ri" value="${esc(r.name)}">` : esc(r.f ? r.name : dn(r))}${!r.f && r.favorite ? ' ' + ic('star', 11, '#F5B301', '#F5B301', 1) : ''}</div><div class="mm">${esc(metaOf(r))}</div></div>${S.selMode ? `<span class="mck">${ic('check', 14, 'currentColor', 'none', 2.6)}</span>` : ''}</div>`;
 };
 function homeHtml() {
   const sum = S.sum;
@@ -665,7 +671,7 @@ function vlcSetup(l) {
 }
 function openItem(k) {
   const it = byKey(k); if (!it) return;
-  if (it.f) return go({t: 'folder', id: it.id});
+  if (it.f) return go(it.tp ? topicView(it) : {t: 'folder', id: it.id});
   if (isMedia(it)) return playVlc(it);
   if (it.kind === 'image') return openGallery(it);
   if (it.ext === 'pdf') return viewer(it, `<iframe src="/_ex/preview/${it.id}/${enc(it.name)}"></iframe>`);
@@ -747,7 +753,7 @@ const ACT = {
   tg: v => { S.open.has(v) ? S.open.delete(v) : S.open.add(v); saveOpen(); },
   back: () => history.back(), fwd: () => history.forward(), rec: () => { S.menu = !S.menu; },
   recgo: v => { const r = S.recent[+v]; S.menu = 0; if (r) go(r.v); },
-  up: () => { const v = S.view; if (v.t === 'folder') { const f = S.folders.find(x => x.id === v.id); go(f && f.parent_id ? {t: 'folder', id: f.parent_id} : {t: 'folders'}); } else if (v.t !== 'home') go({t: 'home'}); },
+  up: () => { const v = S.view; if (v.t === 'topic') go({t: 'channel', id: v.id}); else if (v.t === 'folder') { const f = S.folders.find(x => x.id === v.id); go(f && f.parent_id ? {t: 'folder', id: f.parent_id} : {t: 'folders'}); } else if (v.t !== 'home') go({t: 'home'}); },
   refresh: () => { refreshSummary().then(() => load(true)); },
   sel: (v, e) => {
     if (S.ren === v) return;
@@ -838,6 +844,7 @@ document.addEventListener('contextmenu', e => {
   if (!el) { if (e.target.closest('#main')) { S.sel.clear(); render(); showMenu(e, [{label: 'View: Large icons', fn: () => { ACT.view('icons'); render(); }}, {label: 'View: Details', fn: () => { ACT.view('details'); render(); }}, '-', {label: 'Refresh', fn: () => ACT.refresh()}, '-', {label: 'New folder', fn: newFolder}]); } return; }
   const k = el.dataset.v; if (!S.sel.has(k)) { S.sel = new Set([k]); render(); }
   const one = sel1(), files = selFiles();
+  if (S.sel.size === 1 && one && one.tp) return showMenu(e, [{label: 'Open', fn: () => go(topicView(one))}, {label: 'Copy folder link', fn: () => { const u = location.origin + viewToPath(topicView(one)); (navigator.clipboard ? navigator.clipboard.writeText(u) : Promise.reject()).then(() => flash('Folder link copied'), () => dlg('Folder link', `<input type="text" readonly value="${esc(u)}" onclick="this.select()">`, [{l: 'Close'}])); }}]);
   if (S.sel.size === 1 && one.f) return showMenu(e, [{label: 'Open', fn: () => go({t: 'folder', id: one.id})}, {label: 'Copy folder link', fn: () => { const u = location.origin + viewToPath({t: 'folder', id: one.id}); (navigator.clipboard ? navigator.clipboard.writeText(u) : Promise.reject()).then(() => flash('Folder link copied'), () => dlg('Folder link', `<input type="text" readonly value="${esc(u)}" onclick="this.select()">`, [{l: 'Close'}])); }}, '-', {label: 'Rename', fn: () => { S.ren = fkey(one); render(); }}, {label: 'Delete', fn: () => deleteFolder(one)}, '-', {label: 'Properties', fn: props}]);
   const multi = files.length > 1, f1 = files[0]; if (!f1) return;
   const out = [{label: multi ? `Open ${files.length} items` : (isMedia(f1) ? 'Play in VLC' : 'Open'), fn: () => openItem(f1.id)}];
