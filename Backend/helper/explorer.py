@@ -184,8 +184,7 @@ def message_to_doc(message, channel_name: str = "", topic_name: str = "") -> Opt
 
 #----- JSON-friendly view of an index document
 def public_doc(doc: dict) -> dict:
-    up = doc.get("date")
-    d = doc.get("sdate") or up          #----- the real date taken when known, otherwise the Telegram upload date
+    d = doc.get("date")
     return {
         "id": doc["_id"],
         "chat_id": doc["chat_id"],
@@ -197,7 +196,6 @@ def public_doc(doc: dict) -> dict:
         "kind": doc.get("kind", "other"),
         "attr": doc.get("attr", ""),
         "date": (d.replace(tzinfo=timezone.utc).isoformat() if isinstance(d, datetime) else None),
-        "uploaded": (up.replace(tzinfo=timezone.utc).isoformat() if isinstance(up, datetime) else None),
         "caption": doc.get("caption", ""),
         "duration": doc.get("duration", 0),
         "width": doc.get("width", 0),
@@ -243,18 +241,13 @@ class ExplorerStore:
             await f.create_index([("chat_id", 1), ("msg_id", -1)])
             await f.create_index([("kind", 1), ("date", -1)])
             await f.create_index([("date", -1)])
-            await f.create_index([("sdate", -1), ("msg_id", -1)])
-            await f.create_index([("kind", 1), ("sdate", -1)])
-            #----- one-time fill: files indexed before this version get sdate = their Telegram date
-            try:
-                await f.update_many({"sdate": {"$exists": False}}, [{"$set": {"sdate": "$date"}}])
-            except Exception as e:
-                LOGGER.warning(f"[Explorer] sdate fill failed (sorting still works for new files): {e}")
+            await f.create_index([("taken", -1), ("msg_id", -1)])
             await f.create_index([("name_lc", 1)])
             await f.create_index([("size", -1)])
             await f.create_index([("folder_id", 1)])
             await f.create_index([("fav", 1)])
             await f.create_index([("chat_id", 1), ("topic_id", 1)])
+            await f.create_index([("chat_id", 1), ("topic_name", 1), ("name", 1)])
             self._indexes_ready = True
         except Exception as e:
             LOGGER.warning(f"[Explorer] index creation failed: {e}")
@@ -269,22 +262,31 @@ class ExplorerStore:
         #----- folder_id / fav are only set on insert so re-indexing never undoes the user's organisation
         await self.files.update_one(
             {"_id": _id},
-            {"$set": d, "$setOnInsert": {"folder_id": None, "fav": False, "sdate": d.get("date")}},
+            {"$set": d, "$setOnInsert": {"folder_id": None, "fav": False}},
             upsert=True,
         )
 
     async def set_taken(self, items: List[dict]) -> int:
-        """Stores the real 'date taken' (unix seconds) for already indexed files. Tiny bulk update, no file access."""
-        from pymongo import UpdateOne
+        """Stores the real 'date taken' (unix seconds) for already indexed files. Small bulk update, no file access.
+        An item is {c: chat id, m: message id, t: seconds}  or  {c: chat id, f: topic name, n: file name, t: seconds}."""
+        from pymongo import UpdateMany, UpdateOne
         ops = []
         for it in items:
             try:
-                c, m, t = int(it["c"]), int(it["m"]), int(it["t"])
+                t = int(it["t"])
+                c = int(it["c"])
             except (KeyError, TypeError, ValueError):
                 continue
-            if t > 0:
-                sd = datetime.fromtimestamp(t, tz=timezone.utc).replace(tzinfo=None)
-                ops.append(UpdateOne({"_id": make_fid(c, m)}, {"$set": {"taken": t, "sdate": sd}}))
+            if t <= 0:
+                continue
+            upd = {"$set": {"taken": t}}
+            if it.get("m") is not None:
+                try:
+                    ops.append(UpdateOne({"_id": make_fid(c, int(it["m"]))}, upd))
+                except (TypeError, ValueError):
+                    continue
+            elif it.get("f") and it.get("n"):
+                ops.append(UpdateMany({"chat_id": c, "topic_name": str(it["f"]), "name": str(it["n"])}, upd))
         if not ops:
             return 0
         res = await self.files.bulk_write(ops, ordered=False)
@@ -333,9 +335,10 @@ class ExplorerStore:
         sort_spec = {
             "name": [("name_lc", direction)],
             "size": [("size", direction), ("name_lc", 1)],
-            "date": [("sdate", direction), ("msg_id", direction)],
+            "date": [("date", direction), ("msg_id", direction)],
+            "taken": [("taken", direction), ("msg_id", direction)],
             "type": [("ext", direction), ("name_lc", 1)],
-        }.get(sort, [("sdate", -1)])
+        }.get(sort, [("date", -1)])
         total = await self.files.count_documents(query)
         cursor = self.files.find(query).sort(sort_spec).skip((page - 1) * limit).limit(limit)
         items = [public_doc(d) async for d in cursor]
