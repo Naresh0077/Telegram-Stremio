@@ -184,7 +184,8 @@ def message_to_doc(message, channel_name: str = "", topic_name: str = "") -> Opt
 
 #----- JSON-friendly view of an index document
 def public_doc(doc: dict) -> dict:
-    d = doc.get("date")
+    up = doc.get("date")
+    d = doc.get("sdate") or up          #----- the real date taken when known, otherwise the Telegram upload date
     return {
         "id": doc["_id"],
         "chat_id": doc["chat_id"],
@@ -196,6 +197,7 @@ def public_doc(doc: dict) -> dict:
         "kind": doc.get("kind", "other"),
         "attr": doc.get("attr", ""),
         "date": (d.replace(tzinfo=timezone.utc).isoformat() if isinstance(d, datetime) else None),
+        "uploaded": (up.replace(tzinfo=timezone.utc).isoformat() if isinstance(up, datetime) else None),
         "caption": doc.get("caption", ""),
         "duration": doc.get("duration", 0),
         "width": doc.get("width", 0),
@@ -204,6 +206,8 @@ def public_doc(doc: dict) -> dict:
         "channel": doc.get("channel_name") or str(doc.get("chat_id")),
         "topic_id": doc.get("topic_id"),
         "topic": doc.get("topic_name") or "",
+        "taken": (datetime.fromtimestamp(int(doc["taken"]), tz=timezone.utc).isoformat()
+                  if isinstance(doc.get("taken"), (int, float)) and doc["taken"] > 0 else None),
         "folder_id": doc.get("folder_id"),
         "favorite": bool(doc.get("fav")),
     }
@@ -239,6 +243,13 @@ class ExplorerStore:
             await f.create_index([("chat_id", 1), ("msg_id", -1)])
             await f.create_index([("kind", 1), ("date", -1)])
             await f.create_index([("date", -1)])
+            await f.create_index([("sdate", -1), ("msg_id", -1)])
+            await f.create_index([("kind", 1), ("sdate", -1)])
+            #----- one-time fill: files indexed before this version get sdate = their Telegram date
+            try:
+                await f.update_many({"sdate": {"$exists": False}}, [{"$set": {"sdate": "$date"}}])
+            except Exception as e:
+                LOGGER.warning(f"[Explorer] sdate fill failed (sorting still works for new files): {e}")
             await f.create_index([("name_lc", 1)])
             await f.create_index([("size", -1)])
             await f.create_index([("folder_id", 1)])
@@ -258,9 +269,26 @@ class ExplorerStore:
         #----- folder_id / fav are only set on insert so re-indexing never undoes the user's organisation
         await self.files.update_one(
             {"_id": _id},
-            {"$set": d, "$setOnInsert": {"folder_id": None, "fav": False}},
+            {"$set": d, "$setOnInsert": {"folder_id": None, "fav": False, "sdate": d.get("date")}},
             upsert=True,
         )
+
+    async def set_taken(self, items: List[dict]) -> int:
+        """Stores the real 'date taken' (unix seconds) for already indexed files. Tiny bulk update, no file access."""
+        from pymongo import UpdateOne
+        ops = []
+        for it in items:
+            try:
+                c, m, t = int(it["c"]), int(it["m"]), int(it["t"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if t > 0:
+                sd = datetime.fromtimestamp(t, tz=timezone.utc).replace(tzinfo=None)
+                ops.append(UpdateOne({"_id": make_fid(c, m)}, {"$set": {"taken": t, "sdate": sd}}))
+        if not ops:
+            return 0
+        res = await self.files.bulk_write(ops, ordered=False)
+        return res.matched_count
 
     async def delete_messages(self, chat_id: int, msg_ids: List[int]) -> int:
         if not msg_ids:
@@ -305,9 +333,9 @@ class ExplorerStore:
         sort_spec = {
             "name": [("name_lc", direction)],
             "size": [("size", direction), ("name_lc", 1)],
-            "date": [("date", direction), ("msg_id", direction)],
+            "date": [("sdate", direction), ("msg_id", direction)],
             "type": [("ext", direction), ("name_lc", 1)],
-        }.get(sort, [("date", -1)])
+        }.get(sort, [("sdate", -1)])
         total = await self.files.count_documents(query)
         cursor = self.files.find(query).sort(sort_spec).skip((page - 1) * limit).limit(limit)
         items = [public_doc(d) async for d in cursor]
