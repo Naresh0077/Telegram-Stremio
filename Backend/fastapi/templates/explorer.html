@@ -269,6 +269,7 @@ home:'<path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V1
 stop:'<rect width="14" height="14" x="5" y="5"/>',
 'zoom-in':'<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/><path d="M11 8v6"/><path d="M8 11h6"/>','zoom-out':'<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/><path d="M8 11h6"/>',
 menu:'<path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h16"/>',more:'<circle cx="12" cy="5" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="12" cy="19" r="1.3"/>','check-square':'<path d="m9 11 3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
+calendar:'<rect width="18" height="18" x="3" y="4"/><path d="M16 2v4"/><path d="M8 2v4"/><path d="M3 10h18"/>',
 sync:'<path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/>'};
 const ic = (k, s = 16, c = 'currentColor', f = 'none', w = 1.6) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="${f}" stroke="${c}" stroke-width="${w}" stroke-linecap="square" stroke-linejoin="miter">${I[k]}</svg>`;
 const FOLDER_IC = (s = 16) => ic('folder', s, '#D9A21B', '#FFE08A', s > 30 ? 1.1 : 1.4);
@@ -438,7 +439,7 @@ function ribbon() {
   const running = S.sum && S.sum.status.running;
   const opt = (arr, cur, all) => `<option value="">${all}</option>` + arr.map(([v, l]) => `<option value="${esc(v)}" ${String(cur) === String(v) ? 'selected' : ''}>${esc(l)}</option>`).join('');
   const P = {
-    File: grp('Telegram', rb('sync', running ? 'Stop sync' : 'Sync channels', 'sync', {c: '#2aabee'}) + rb('refresh', 'Full re-index', 'fullsync', {d: running}))
+    File: grp('Telegram', rb('sync', running ? 'Stop sync' : 'Sync channels', 'sync', {c: '#2aabee'}) + rb('refresh', 'Full re-index', 'fullsync', {d: running}) + rb('calendar', 'Import dates', 'importdates', {c: '#F5B301'}))
       + grp('Folder', rb('refresh', 'Refresh', 'refresh'))
       + grp('Open', rb('play', 'VLC setup', 'vlcsetup', {c: '#f77f00'}) + rb('gauge', 'Admin panel', 'admin')),
     Home: grp('Clipboard', rb('star', fav ? 'Remove from favorites' : 'Add to favorites', 'fav', {d: !files.length, c: '#F5B301'}) + rb('link', 'Copy link', 'copylink', {d: !oneFile}))
@@ -619,7 +620,7 @@ function mSelMenu() {
   const files = selFiles(), fo = selFolder(), one = sel1(), oneF = one && !one.f ? one : null, e = [];
   if (one) e.push({label: one.f ? 'Open' : isMedia(one) ? 'Play in VLC' : 'Open', icon: 'play', color: '#f77f00', fn: () => openItem([...S.sel][0])});
   if (oneF) { e.push({label: 'Copy link', icon: 'link', fn: () => copyLink(oneF)}, {label: 'Open in Stremio', icon: 'external', fn: () => ACT.stremio()}); if (!isMedia(oneF)) e.push({label: 'Download', icon: 'download', fn: () => download(oneF)}); }
-  if (files.length) { const all = files.every(i => i.favorite); e.push({label: all ? 'Remove from favorites' : 'Add to favorites', icon: 'star', color: '#F5B301', fn: () => setFav(files, !all)}, {label: 'Move to…', icon: 'folder-in', fn: () => moveDialog(files.map(i => i.id))}); if (files.some(i => i.folder_id)) e.push({label: 'Remove from folder', icon: 'folder-minus', fn: () => ACT.unfile()}); }
+  if (files.length) { const all = files.every(i => i.favorite); e.push({label: all ? 'Remove from favorites' : 'Add to favorites', icon: 'star', color: '#F5B301', fn: () => setFav(files, !all)}, {label: 'Move to…', icon: 'folder-in', fn: () => moveDialog(files.map(i => i.id))}); if (files.some(i => i.folder_id)) e.push({label: 'Remove from folder', icon: 'folder-minus', fn: () => ACT.unfile()}); e.push({label: 'Delete', icon: 'trash', color: '#F1707B', fn: () => deleteFiles(files)}); }
   if (fo) e.push({label: 'Rename', icon: 'pencil', fn: () => { S.ren = fkey(fo); render(); }}, {label: 'Delete folder', icon: 'trash', color: '#F1707B', fn: () => deleteFolder(fo)});
   e.push({label: 'Properties', icon: 'info', fn: props});
   sheet(`${S.sel.size} selected`, e);
@@ -690,6 +691,12 @@ async function moveFiles(ids, folderId) {
   try { const r = await api('/api/explorer/move', {method: 'POST', body: {file_ids: ids, folder_id: folderId}}); flash(`Moved ${r.moved} item${r.moved === 1 ? '' : 's'} (the Telegram files are untouched)`); await refreshSummary(); load(true); }
   catch (e) { flash(e.message); }
 }
+function deleteFiles(files) {
+  if (!files.length) return;
+  const n = files.length, what = n === 1 ? `“${esc(files[0].name)}”` : `these ${n} files`;
+  dlg('Delete', `<p style="margin-top:0">Are you sure you want to delete ${what}?</p><p><b>${n === 1 ? 'It is' : 'They are'} deleted from Telegram too and cannot be recovered.</b></p>`,
+    [{l: 'Delete', pri: true, fn: async () => { try { const r = await api('/api/explorer/delete-files', {method: 'POST', body: {file_ids: files.map(i => i.id)}}); S.sel.clear(); flash(r.failed ? `Deleted ${r.deleted}, ${r.failed} could not be deleted` : `Deleted ${r.deleted} file${r.deleted === 1 ? '' : 's'}`); await refreshSummary(); load(true); } catch (e) { flash(e.message); } }}, {l: 'Cancel'}]);
+}
 async function setFav(files, value) { try { await api('/api/explorer/favorite', {method: 'POST', body: {file_ids: files.map(i => i.id), value}}); files.forEach(i => i.favorite = value); await refreshSummary(); if (S.view.t === 'fav') load(true); else render(); } catch (e) { flash(e.message); } }
 function folderOptions(onPick) {
   const tree = (p, d) => S.folders.filter(f => (f.parent_id || null) === p).map(f => `<div class="mi it" data-a="pick" data-v="${f.id}" style="padding-left:${10 + d * 16}px">${FOLDER_IC(16)}${esc(f.name)}</div>` + tree(f.id, d + 1)).join('');
@@ -726,7 +733,7 @@ function props() {
   if (!one) { const parts = crumbParts(); return dlg('Properties', `<div class="fx ac" style="gap:10px;margin-bottom:8px">${FOLDER_IC(36)}<b>${esc(parts[parts.length - 1][0])}</b></div><table><tr><td>Items:</td><td>${S.view.t === 'home' ? (S.sum?.total || 0) : S.total}</td></tr></table>`); }
   if (one.f) return dlg('Properties', `<div class="fx ac" style="gap:10px;margin-bottom:8px">${FOLDER_IC(36)}<b>${esc(one.name)}</b></div><table><tr><td>Type:</td><td>File folder (virtual)</td></tr><tr><td>Location:</td><td>${esc(folderPath(one.id).map(f => f.name).join(' › '))}</td></tr><tr><td>Contains:</td><td>${one.count} items</td></tr></table>`);
   dlg('Properties', `<div class="fx ac" style="gap:10px;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--line)">${iconOf(one, 36)}<b style="word-break:break-all">${esc(one.name)}</b></div><table>
-    <tr><td>Type:</td><td>${esc(typeOf(one))} (${esc(one.mime || '')})</td></tr><tr><td>Size:</td><td>${fmtBig(one.size)} (${(+one.size).toLocaleString()} bytes)</td></tr><tr><td>Modified:</td><td>${fmtD(one.date)}</td></tr>
+    <tr><td>Type:</td><td>${esc(typeOf(one))} (${esc(one.mime || '')})</td></tr><tr><td>Size:</td><td>${fmtBig(one.size)} (${(+one.size).toLocaleString()} bytes)</td></tr><tr><td>Modified:</td><td>${fmtD(one.date)}</td></tr>${one.taken ? `<tr><td>Date taken:</td><td>${fmtD(one.taken)}</td></tr><tr><td>Uploaded:</td><td>${fmtD(one.uploaded)}</td></tr>` : ''}
     ${one.duration ? `<tr><td>Length:</td><td>${fmtDur(one.duration)}</td></tr>` : ''}${one.width ? `<tr><td>Dimensions:</td><td>${one.width} × ${one.height}</td></tr>` : ''}
     <tr><td>Source channel:</td><td>${esc(one.channel)}</td></tr><tr><td>Message:</td><td>#${one.msg_id}</td></tr><tr><td>Folder:</td><td>${esc(one.folder_id ? folderPath(one.folder_id).map(f => f.name).join(' › ') : '—')}</td></tr>${one.kind === 'video' ? `<tr><td>Thumbnail:</td><td><a href="/api/explorer/thumb-debug/${one.id}" target="_blank" style="color:#3FA0F0">Diagnose</a></td></tr>` : ''}</table>`);
 }
@@ -783,6 +790,7 @@ const ACT = {
   dl: () => { const one = sel1(); if (one && !one.f) download(one); },
   m3u: async () => { const one = sel1(); if (!one || one.f) return; try { const l = await links(one); const a = document.createElement('a'); a.href = l.vlc_playlist; a.download = ''; document.body.appendChild(a); a.click(); a.remove(); } catch (e) { msgbox('VLC playlist', e.message); } },
   sync: () => { const st = S.sum && S.sum.status; if (st && st.running) dlg('Stop indexing?', '<p style="margin:0">Stop scanning your Telegram channels now? Progress is kept and resumes next time.</p>', [{l: 'Stop', pri: true, fn: () => api('/api/explorer/sync/cancel', {method: 'POST'})}, {l: 'Cancel'}]); else dlg('Sync Telegram files', '<p style="margin-top:0">Scans your configured channels for new files and resumes where it last stopped. New uploads are also indexed live automatically.</p><p style="margin-bottom:0;color:var(--muted)">The bot posts and instantly deletes a tiny probe message in each channel to find its newest message id, like the admin Scan tool.</p>', [{l: 'Sync now', pri: true, fn: () => startSync(false)}, {l: 'Cancel'}]); },
+  importdates: () => { const inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.jsonl,.txt,.json'; inp.onchange = async () => { const file = inp.files[0]; if (!file) return; try { const text = await file.text(); const items = []; for (const line of text.split(/\r?\n/)) { const t = line.trim(); if (!t) continue; try { const o = JSON.parse(t); if (o && o.c != null && o.m != null && o.t) items.push({c: o.c, m: o.m, t: o.t}); } catch (e) {} } if (!items.length) return flash('No dates found in that file'); let done = 0; for (let i = 0; i < items.length; i += 1000) { const r = await api('/api/explorer/taken-dates', {method: 'POST', body: {items: items.slice(i, i + 1000)}}); done += r.updated; flash(`Importing dates ${Math.min(i + 1000, items.length)} / ${items.length}`); } flash(`Date taken imported for ${done} of ${items.length} files`); load(true); } catch (e) { flash(e.message); } }; inp.click(); },
   fullsync: () => dlg('Full re-index', '<p style="margin:0">Re-scan every message from the beginning? This can take a while on large channels and also removes entries for deleted messages.</p>', [{l: 'Re-index', pri: true, fn: () => startSync(true)}, {l: 'Cancel'}]),
   vlcsetup: () => vlcSetup(null), admin: () => { location.href = '/'; },
   mclose: () => { S.modal = null; },
@@ -852,7 +860,7 @@ document.addEventListener('contextmenu', e => {
   if (!multi) out.push({label: 'Copy link', fn: () => copyLink(f1)});
   out.push('-', {label: files.every(i => i.favorite) ? 'Remove from Favorites' : 'Add to Favorites', fn: () => setFav(files, !files.every(i => i.favorite))}, {label: 'Move to…', fn: () => moveDialog(files.map(i => i.id))});
   if (files.some(i => i.folder_id)) out.push({label: 'Remove from folder', fn: () => moveFiles(files.filter(i => i.folder_id).map(i => i.id), null)});
-  out.push('-', {label: 'Properties', fn: props});
+  out.push('-', {label: 'Delete', fn: () => deleteFiles(files)}, '-', {label: 'Properties', fn: props});
   showMenu(e, out);
 });
 
@@ -891,6 +899,7 @@ document.addEventListener('keydown', e => {
   if (document.querySelector('.viewer')) return;
   if (S.modal) { if (e.key === 'Escape') { S.modal = null; render(); } return; }
   if (e.key === 'Delete' && selFolder()) { ACT.del(); render(); }
+  else if (e.key === 'Delete' && selFiles().length) { e.preventDefault(); deleteFiles(selFiles()); }
   else if (e.key === 'F2' && selFolder()) { ACT.ren(); render(); }
   else if (e.key === 'Enter' && S.sel.size === 1) openItem([...S.sel][0]);
   else if (e.key === 'Backspace') { e.preventDefault(); history.back(); }
