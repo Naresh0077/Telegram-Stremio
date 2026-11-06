@@ -241,6 +241,54 @@ async def api_favorite(payload: dict, _: bool = Depends(require_auth)):
     return {"updated": await get_store().set_favorite(fids, bool(payload.get("value", True)))}
 
 
+#----- Real "date taken" per file, sent by the upload script (one small batch at a time) ---------------------------------
+@router.post("/api/explorer/taken-dates")
+async def api_taken_dates(payload: dict, _: bool = Depends(require_auth)):
+    items = payload.get("items") or []
+    if not isinstance(items, list) or len(items) > 2000:
+        raise HTTPException(status_code=400, detail="send at most 2000 items at a time")
+    return {"updated": await get_store().set_taken(items)}
+
+
+#----- Delete files: removes the Telegram message(s) AND the Explorer index entry ------------------------------------------
+@router.post("/api/explorer/delete-files")
+async def api_delete_files(payload: dict, _: bool = Depends(require_auth)):
+    fids: List[str] = [f for f in (payload.get("file_ids") or []) if isinstance(f, str)][:500]
+    try:
+        for f in fids:
+            parse_fid(f)
+    except ValueError as e:
+        _err(e)
+    store = get_store()
+    by_chat: dict = {}
+    for f in fids:
+        chat_id, msg_id = parse_fid(f)
+        by_chat.setdefault(chat_id, []).append(msg_id)
+    import Backend.pyrofork.bot as botmod
+    clients = [c for c in (StreamBot, botmod.Userbot) if c is not None]
+    deleted, failed = 0, 0
+    for chat_id, ids in by_chat.items():
+        for i in range(0, len(ids), 100):
+            chunk = ids[i:i + 100]
+            ok, last_err = False, None
+            for c in clients:
+                try:
+                    await c.delete_messages(chat_id, chunk)
+                    ok = True
+                    break
+                except Exception as e:
+                    last_err = e
+            if ok:
+                await store.delete_messages(chat_id, chunk)
+                deleted += len(chunk)
+            else:
+                failed += len(chunk)
+                LOGGER.warning(f"[Explorer] delete failed in {chat_id}: {last_err}")
+    if failed and not deleted:
+        raise HTTPException(status_code=403, detail="Telegram refused the delete - make the bot an admin with the 'Delete messages' permission")
+    return {"deleted": deleted, "failed": failed}
+
+
 #----- Links: the admin panel's stream link / VLC / Stremio -------------------------------------------------------------
 @router.get("/api/explorer/links/{fid}")
 async def api_links(fid: str, request: Request, _: bool = Depends(require_auth)):
